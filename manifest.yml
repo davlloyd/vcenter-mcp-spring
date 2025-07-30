@@ -1,0 +1,15 @@
+---
+applications:
+  - name: vcenter-mcp-server
+    buildpacks:
+      - java_buildpack_offline
+    memory: 1G
+    instances: 1
+    path: target/vcenter-mcp-0.0.1-SNAPSHOT.jar
+    env:
+      JBP_CONFIG_OPEN_JDK_JRE: '{ jre: { version: 21.+ } }'
+    services:
+      - vcenter-service
+    #health-check-type: process
+      # vCenter configuration will be provided via service binding
+      # No need to set VCENTER_* variables here as they come from the service binding
