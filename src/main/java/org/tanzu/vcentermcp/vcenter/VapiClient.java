@@ -256,14 +256,19 @@ public class VapiClient {
                     }
                 }
                 
-                response = webClient.mutate()
-                    .defaultHeader("vmware-api-session-id", sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods()))
-                    .build()
-                    .get()
-                    .uri(finalEndpoint)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+                            String sessionToken = sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods());
+            if (sessionToken == null) {
+                throw new RuntimeException("Failed to create vAPI session: All authentication methods failed");
+            }
+            
+            response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .get()
+                .uri(finalEndpoint)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
                 logger.info("vAPI GET request to {}", finalEndpoint);
             } else {
                 // Use POST for other operations
@@ -274,15 +279,20 @@ public class VapiClient {
                 }
                 String requestBody = objectMapper.writeValueAsString(request);
                 logger.info("vAPI request body: {}", requestBody);
-                response = webClient.mutate()
-                    .defaultHeader("vmware-api-session-id", sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods()))
-                    .build()
-                    .post()
-                    .uri(endpoint)
-                    .bodyValue(requestBody)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+                            String sessionToken = sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods());
+            if (sessionToken == null) {
+                throw new RuntimeException("Failed to create vAPI session: All authentication methods failed");
+            }
+            
+            response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .post()
+                .uri(endpoint)
+                .bodyValue(requestBody)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
             }
             
             logger.info("vAPI raw response: {}", response);
@@ -437,7 +447,8 @@ public class VapiClient {
             logger.warn("Method 3 failed: {}", e.getMessage());
         }
         
-        return null;
+        logger.error("All authentication methods failed. Cannot establish vAPI session with vCenter.");
+        throw new RuntimeException("Failed to authenticate with vCenter vAPI: All authentication methods failed");
     }
     
     /**

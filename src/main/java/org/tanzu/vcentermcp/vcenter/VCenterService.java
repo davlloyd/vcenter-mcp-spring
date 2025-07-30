@@ -69,11 +69,15 @@ public class VCenterService {
             JsonNode clustersNode = vapiClient.clusters().list();
             
             logger.info("Raw clusters response: {}", clustersNode.toString());
+            logger.info("Clusters response type: {}", clustersNode.getNodeType());
+            logger.info("Clusters response is array: {}", clustersNode.isArray());
+            logger.info("Clusters response size: {}", clustersNode.size());
             
             List<ClusterInfo> result = new ArrayList<>();
             for (JsonNode cluster : clustersNode) {
-                logger.debug("Processing cluster node: {}", cluster.toString());
-                logger.debug("Available fields: {}", cluster.fieldNames());
+                logger.info("Processing cluster node: {}", cluster.toString());
+                logger.info("Available fields: {}", cluster.fieldNames());
+                logger.info("Cluster node type: {}", cluster.getNodeType());
                 
                 // Check if fields exist before accessing them
                 if (!cluster.has("cluster")) {
