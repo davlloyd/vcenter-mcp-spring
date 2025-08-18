@@ -238,9 +238,10 @@ public class VapiClient {
             logger.info("vAPI endpoint: {}", endpoint);
             
             String response;
+            String requestBody = null;
+            String finalEndpoint = endpoint;
             if ("list".equals(operation)) {
                 // Use GET for all list operations in vCenter 8.0
-                String finalEndpoint = endpoint;
                 if (input != null && !input.isEmpty()) {
                     // Add query parameters for filtering
                     StringBuilder queryParams = new StringBuilder();
@@ -256,10 +257,7 @@ public class VapiClient {
                     }
                 }
                 
-                            String sessionToken = sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods());
-            if (sessionToken == null) {
-                throw new RuntimeException("Failed to create vAPI session: All authentication methods failed");
-            }
+                            String sessionToken = getValidSessionToken();
             
             response = webClient.mutate()
                 .defaultHeader("vmware-api-session-id", sessionToken)
@@ -277,12 +275,9 @@ public class VapiClient {
                 if (input != null) {
                     request.setAll(input);
                 }
-                String requestBody = objectMapper.writeValueAsString(request);
+                requestBody = objectMapper.writeValueAsString(request);
                 logger.info("vAPI request body: {}", requestBody);
-                            String sessionToken = sessionTokens.computeIfAbsent("session", key -> tryCreateSessionWithMultipleMethods());
-            if (sessionToken == null) {
-                throw new RuntimeException("Failed to create vAPI session: All authentication methods failed");
-            }
+                String sessionToken = getValidSessionToken();
             
             response = webClient.mutate()
                 .defaultHeader("vmware-api-session-id", sessionToken)
@@ -327,6 +322,15 @@ public class VapiClient {
             
             return result;
         } catch (Exception e) {
+            // Check if this is a 401 Unauthorized error, which indicates session token is invalid
+            if (e.getMessage() != null && e.getMessage().contains("401 Unauthorized")) {
+                logger.warn("Received 401 Unauthorized, clearing cached session token and retrying once");
+                sessionTokens.remove("session"); // Clear the invalid token
+                
+                // Retry the entire method call with fresh session
+                return invokeVapiMethodWithFreshSession(service, operation, input);
+            }
+            
             logger.error("Failed to invoke vAPI method {}.{}: {}", service, operation, e.getMessage(), e);
             throw new RuntimeException("vAPI method invocation failed: " + e.getMessage(), e);
         }
@@ -449,6 +453,139 @@ public class VapiClient {
         
         logger.error("All authentication methods failed. Cannot establish vAPI session with vCenter.");
         throw new RuntimeException("Failed to authenticate with vCenter vAPI: All authentication methods failed");
+    }
+    
+    /**
+     * Gets a valid session token, refreshing it if necessary.
+     * 
+     * This method checks if a session token exists and is valid. If the token
+     * is missing or invalid (causing 401 errors), it will clear the cached token
+     * and create a new session.
+     * 
+     * @return A valid session token
+     */
+    private String getValidSessionToken() {
+        String sessionToken = sessionTokens.get("session");
+        if (sessionToken == null) {
+            logger.info("No cached session token found, creating new session");
+            sessionToken = tryCreateSessionWithMultipleMethods();
+            if (sessionToken != null) {
+                sessionTokens.put("session", sessionToken);
+            }
+        }
+        return sessionToken;
+    }
+    
+    /**
+     * Invokes a vAPI method with a fresh session token after a 401 error.
+     * 
+     * This method is called when the original vAPI call fails with a 401 Unauthorized
+     * error, indicating that the session token has expired. It creates a fresh session
+     * and retries the operation once.
+     * 
+     * @param service The vAPI service name
+     * @param operation The vAPI operation name
+     * @param input The input parameters for the operation
+     * @return The response from the vAPI call
+     * @throws RuntimeException if the retry also fails
+     */
+    private JsonNode invokeVapiMethodWithFreshSession(String service, String operation, ObjectNode input) {
+        try {
+            logger.info("Retrying vAPI method {}.{} with fresh session token", service, operation);
+            
+            // Get a fresh session token
+            String freshSessionToken = getValidSessionToken();
+            
+            // Map vAPI service to the correct vCenter vAPI endpoint
+            String endpoint = mapVapiServiceToEndpoint(service);
+            logger.info("vAPI retry endpoint: {}", endpoint);
+            
+            String response;
+            if ("list".equals(operation)) {
+                // Use GET for all list operations in vCenter 8.0
+                String finalEndpoint = endpoint;
+                if (input != null && !input.isEmpty()) {
+                    // Add query parameters for filtering
+                    StringBuilder queryParams = new StringBuilder();
+                    if (input.has("cluster")) {
+                        queryParams.append("clusters=").append(input.get("cluster").asText());
+                    }
+                    if (input.has("resource_pool")) {
+                        if (queryParams.length() > 0) queryParams.append("&");
+                        queryParams.append("resource_pools=").append(input.get("resource_pool").asText());
+                    }
+                    if (queryParams.length() > 0) {
+                        finalEndpoint = endpoint + "?" + queryParams.toString();
+                    }
+                }
+                
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", freshSessionToken)
+                    .build()
+                    .get()
+                    .uri(finalEndpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+                logger.info("vAPI retry GET request to {}", finalEndpoint);
+            } else {
+                // Use POST for other operations
+                // Create vAPI request structure
+                ObjectNode request = objectMapper.createObjectNode();
+                if (input != null) {
+                    request.setAll(input);
+                }
+                String requestBody = objectMapper.writeValueAsString(request);
+                logger.info("vAPI retry request body: {}", requestBody);
+                
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", freshSessionToken)
+                    .build()
+                    .post()
+                    .uri(endpoint)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+            }
+            
+            logger.info("vAPI retry successful with fresh session token");
+            
+            // Process the response as before
+            JsonNode responseNode = objectMapper.readTree(response);
+            logger.info("vAPI retry response structure: {}", responseNode.toString());
+            logger.info("vAPI retry response fields: {}", responseNode.fieldNames());
+            
+            // Check for vAPI errors
+            if (responseNode.has("error")) {
+                JsonNode error = responseNode.get("error");
+                String errorMessage = error.path("message").asText("Unknown vAPI error");
+                logger.error("vAPI retry error: {}", errorMessage);
+                throw new RuntimeException("vAPI error: " + errorMessage);
+            }
+            
+            // Handle different response formats
+            JsonNode result;
+            if (responseNode.has("result")) {
+                // Standard vAPI response with "result" field
+                result = responseNode.get("result");
+                logger.info("vAPI retry result from 'result' field: {}", result.toString());
+            } else if (responseNode.isArray()) {
+                // Direct array response
+                result = responseNode;
+                logger.info("vAPI retry result as direct array: {}", result.toString());
+            } else {
+                // Try to use the response as-is
+                result = responseNode;
+                logger.info("vAPI retry result as direct response: {}", result.toString());
+            }
+            
+            return result;
+            
+        } catch (Exception retryException) {
+            logger.error("Retry with fresh session token also failed: {}", retryException.getMessage(), retryException);
+            throw new RuntimeException("vAPI method invocation failed after session refresh: " + retryException.getMessage(), retryException);
+        }
     }
     
     /**
