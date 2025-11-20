@@ -224,3 +224,4 @@ Thumbs.db
 
 # Application specific ignores
 # Add any project-specific files or directories here 
+.vscode/settings.json

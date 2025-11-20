@@ -12,11 +12,16 @@ import org.tanzu.vcentermcp.config.VCenterConfig;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Client for communicating with VMware vCenter using the vAPI (VMware API) protocol.
+ * Client for communicating with VMware vCenter using the vSphere Automation SDK vAPI protocol.
  * 
- * This client implements a VMware SDK-style interface for interacting with vCenter's
- * vAPI endpoints. It provides a fluent API that mimics the structure of the official
- * VMware Java SDK, making it familiar for developers who have worked with VMware APIs.
+ * This client implements the vAPI (VMware API) protocol, which is part of the vSphere Automation SDK.
+ * It provides REST-based access to vCenter's vAPI endpoints using Spring WebClient.
+ * 
+ * The implementation follows VMware SDK patterns and uses:
+ * - vAPI REST endpoints for all operations
+ * - Session-based authentication (vmware-api-session-id)
+ * - JSON request/response format
+ * - Service-oriented architecture matching VMware SDK structure
  * 
  * The client handles:
  * - Session management and authentication with vCenter
@@ -29,9 +34,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * - ClusterService: For cluster operations
  * - ResourcePoolService: For resource pool operations  
  * - VmService: For virtual machine operations
+ * - DataCenterService: For datacenter operations
+ * - HostService: For host operations
+ * - DatastoreService: For datastore operations
+ * - ApplianceService: For appliance/system operations
  * 
- * All operations are read-only and support the MCP server's requirements for
- * listing clusters, resource pools, and virtual machines.
+ * All operations use the vAPI protocol endpoints which are part of the vSphere Automation SDK.
  */
 @Component
 public class VapiClient {
@@ -59,6 +67,18 @@ public class VapiClient {
     
     /** Service interface for virtual machine operations */
     private final VmService vmService;
+    
+    /** Service interface for datacenter operations */
+    private final DataCenterService dataCenterService;
+    
+    /** Service interface for host operations */
+    private final HostService hostService;
+    
+    /** Service interface for datastore operations */
+    private final DatastoreService datastoreService;
+    
+    /** Service interface for appliance/system operations */
+    private final ApplianceService applianceService;
     
     /**
      * Constructs a new VapiClient with the specified configuration.
@@ -90,6 +110,10 @@ public class VapiClient {
         this.clusterService = new ClusterService();
         this.resourcePoolService = new ResourcePoolService();
         this.vmService = new VmService();
+        this.dataCenterService = new DataCenterService();
+        this.hostService = new HostService();
+        this.datastoreService = new DatastoreService();
+        this.applianceService = new ApplianceService();
     }
     
     /**
@@ -129,6 +153,58 @@ public class VapiClient {
      */
     public VmService vms() {
         return vmService;
+    }
+    
+    /**
+     * Returns the datacenter service interface.
+     * 
+     * This method provides access to datacenter-related operations following
+     * the VMware SDK pattern. The returned service can be used to list
+     * datacenters in the vCenter.
+     * 
+     * @return DataCenterService instance for datacenter operations
+     */
+    public DataCenterService datacenters() {
+        return dataCenterService;
+    }
+    
+    /**
+     * Returns the host service interface.
+     * 
+     * This method provides access to host-related operations following
+     * the VMware SDK pattern. The returned service can be used to list
+     * hosts in the vCenter.
+     * 
+     * @return HostService instance for host operations
+     */
+    public HostService hosts() {
+        return hostService;
+    }
+    
+    /**
+     * Returns the datastore service interface.
+     * 
+     * This method provides access to datastore-related operations following
+     * the VMware SDK pattern. The returned service can be used to list
+     * datastores in the vCenter.
+     * 
+     * @return DatastoreService instance for datastore operations
+     */
+    public DatastoreService datastores() {
+        return datastoreService;
+    }
+    
+    /**
+     * Returns the appliance service interface.
+     * 
+     * This method provides access to appliance/system-related operations following
+     * the VMware SDK pattern. The returned service can be used to get
+     * system information like version.
+     * 
+     * @return ApplianceService instance for appliance operations
+     */
+    public ApplianceService appliance() {
+        return applianceService;
     }
     
     /**
@@ -182,7 +258,7 @@ public class VapiClient {
      * 
      * This inner class provides methods for interacting with vCenter virtual machines,
      * following the VMware SDK pattern. Supports listing VMs with optional filtering
-     * by cluster or resource pool.
+     * by cluster or resource pool, as well as power management and migration operations.
      */
     public class VmService {
         /**
@@ -206,6 +282,171 @@ public class VapiClient {
                 input.put("resource_pool", resourcePoolId);
             }
             return invokeVapiMethod("com.vmware.vcenter.VM", "list", input);
+        }
+        
+        /**
+         * Powers on a virtual machine.
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode powerOn(String vmId) {
+            logger.info("=== VAPI VM SERVICE: powerOn({}) ===", vmId);
+            return invokeVmAction(vmId, "start", null);
+        }
+        
+        /**
+         * Powers off a virtual machine (hard power off).
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode powerOff(String vmId) {
+            logger.info("=== VAPI VM SERVICE: powerOff({}) ===", vmId);
+            return invokeVmAction(vmId, "stop", null);
+        }
+        
+        /**
+         * Resets a virtual machine (hard reset).
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode reset(String vmId) {
+            logger.info("=== VAPI VM SERVICE: reset({}) ===", vmId);
+            return invokeVmAction(vmId, "reset", null);
+        }
+        
+        /**
+         * Restarts the guest OS of a virtual machine (soft restart).
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode restart(String vmId) {
+            logger.info("=== VAPI VM SERVICE: restart({}) ===", vmId);
+            return invokeVmGuestAction(vmId, "reboot");
+        }
+        
+        /**
+         * Shuts down the guest OS of a virtual machine (soft shutdown).
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode shutdown(String vmId) {
+            logger.info("=== VAPI VM SERVICE: shutdown({}) ===", vmId);
+            return invokeVmGuestAction(vmId, "shutdown");
+        }
+        
+        /**
+         * Migrates a virtual machine to a different host.
+         * 
+         * @param vmId The ID of the virtual machine
+         * @param hostId The ID of the target host
+         * @return JsonNode containing the operation result
+         */
+        public JsonNode migrate(String vmId, String hostId) {
+            logger.info("=== VAPI VM SERVICE: migrate({}, {}) ===", vmId, hostId);
+            ObjectNode spec = objectMapper.createObjectNode();
+            spec.put("host", hostId);
+            return invokeVmRelocate(vmId, spec);
+        }
+        
+        /**
+         * Gets detailed information about a virtual machine.
+         * 
+         * @param vmId The ID of the virtual machine
+         * @return JsonNode containing detailed VM information
+         */
+        public JsonNode get(String vmId) {
+            logger.info("=== VAPI VM SERVICE: get({}) ===", vmId);
+            return invokeVmGet(vmId);
+        }
+    }
+    
+    /**
+     * Service interface for datacenter operations.
+     * 
+     * This inner class provides methods for interacting with vCenter datacenters,
+     * following the VMware SDK pattern. Supports listing datacenters.
+     */
+    public class DataCenterService {
+        /**
+         * Lists all datacenters in the vCenter.
+         * 
+         * @return JsonNode containing the list of datacenters
+         */
+        public JsonNode list() {
+            logger.info("=== VAPI DATACENTER SERVICE: list() ===");
+            return invokeVapiMethod("com.vmware.vcenter.Datacenter", "list", null);
+        }
+    }
+    
+    /**
+     * Service interface for host operations.
+     * 
+     * This inner class provides methods for interacting with vCenter hosts,
+     * following the VMware SDK pattern. Supports listing hosts.
+     */
+    public class HostService {
+        /**
+         * Lists all hosts in the vCenter.
+         * 
+         * @return JsonNode containing the list of hosts
+         */
+        public JsonNode list() {
+            logger.info("=== VAPI HOST SERVICE: list() ===");
+            return invokeVapiMethod("com.vmware.vcenter.Host", "list", null);
+        }
+    }
+    
+    /**
+     * Service interface for datastore operations.
+     * 
+     * This inner class provides methods for interacting with vCenter datastores,
+     * following the VMware SDK pattern. Supports listing datastores.
+     */
+    public class DatastoreService {
+        /**
+         * Lists all datastores in the vCenter.
+         * 
+         * @return JsonNode containing the list of datastores
+         */
+        public JsonNode list() {
+            logger.info("=== VAPI DATASTORE SERVICE: list() ===");
+            return invokeVapiMethod("com.vmware.vcenter.Datastore", "list", null);
+        }
+        
+        /**
+         * Gets detailed information about a specific datastore.
+         * 
+         * @param datastoreId The ID of the datastore
+         * @return JsonNode containing the datastore details
+         */
+        public JsonNode get(String datastoreId) {
+            logger.info("=== VAPI DATASTORE SERVICE: get({}) ===", datastoreId);
+            ObjectNode input = objectMapper.createObjectNode();
+            input.put("datastore", datastoreId);
+            return invokeVapiMethod("com.vmware.vcenter.Datastore", "get", input);
+        }
+    }
+    
+    /**
+     * Service interface for appliance/system operations.
+     * 
+     * This inner class provides methods for interacting with vCenter appliance
+     * and system information, following the VMware SDK pattern.
+     */
+    public class ApplianceService {
+        /**
+         * Gets the vCenter version information.
+         * 
+         * @return JsonNode containing the version information
+         */
+        public JsonNode getVersion() {
+            logger.info("=== VAPI APPLIANCE SERVICE: getVersion() ===");
+            return invokeVapiMethod("com.vmware.appliance.system.Version", "get", null);
         }
     }
     
@@ -257,17 +498,40 @@ public class VapiClient {
                     }
                 }
                 
-                            String sessionToken = getValidSessionToken();
-            
-            response = webClient.mutate()
-                .defaultHeader("vmware-api-session-id", sessionToken)
-                .build()
-                .get()
-                .uri(finalEndpoint)
-                .retrieve()
-                .bodyToMono(String.class)
-                .block();
+                String sessionToken = getValidSessionToken();
+                
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .get()
+                    .uri(finalEndpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
                 logger.info("vAPI GET request to {}", finalEndpoint);
+            } else if ("get".equals(operation)) {
+                // Use GET for get operations - for version and other simple get operations
+                String sessionToken = getValidSessionToken();
+                String getEndpoint = endpoint;
+                
+                // Handle specific get operations
+                if (service.equals("com.vmware.appliance.system.Version")) {
+                    // Version is a simple GET request
+                    getEndpoint = endpoint;
+                } else if (input != null && input.has("datastore")) {
+                    // Datastore get requires the datastore ID as a query parameter
+                    getEndpoint = endpoint + "?datastores=" + input.get("datastore").asText();
+                }
+                
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .get()
+                    .uri(getEndpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+                logger.info("vAPI GET request for get operation to {}", getEndpoint);
             } else {
                 // Use POST for other operations
                 // Create vAPI request structure
@@ -589,6 +853,180 @@ public class VapiClient {
     }
     
     /**
+     * Invokes a VM power action using the vAPI protocol.
+     * 
+     * @param vmId The ID of the virtual machine
+     * @param action The power action (start, stop, reset)
+     * @param spec Optional specification object
+     * @return JsonNode containing the operation result
+     */
+    private JsonNode invokeVmAction(String vmId, String action, ObjectNode spec) {
+        try {
+            String endpoint = "/api/vcenter/vm/" + vmId + "/power/" + action;
+            logger.info("Invoking VM power action: {} on VM {}", action, vmId);
+            
+            String sessionToken = getValidSessionToken();
+            String response;
+            
+            if (spec != null && !spec.isEmpty()) {
+                String requestBody = objectMapper.writeValueAsString(spec);
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .post()
+                    .uri(endpoint)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+            } else {
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .post()
+                    .uri(endpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+            }
+            
+            logger.info("VM power action response: {}", response);
+            JsonNode responseNode = objectMapper.readTree(response);
+            
+            // Handle empty response (success) or error
+            if (responseNode.has("error")) {
+                JsonNode error = responseNode.get("error");
+                String errorMessage = error.path("message").asText("Unknown error");
+                throw new RuntimeException("vAPI error: " + errorMessage);
+            }
+            
+            return responseNode;
+        } catch (Exception e) {
+            logger.error("Failed to invoke VM power action: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to invoke VM power action: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Invokes a VM guest action using the vAPI protocol.
+     * 
+     * @param vmId The ID of the virtual machine
+     * @param action The guest action (reboot, shutdown)
+     * @return JsonNode containing the operation result
+     */
+    private JsonNode invokeVmGuestAction(String vmId, String action) {
+        try {
+            String endpoint = "/api/vcenter/vm/" + vmId + "/guest/power/" + action;
+            logger.info("Invoking VM guest action: {} on VM {}", action, vmId);
+            
+            String sessionToken = getValidSessionToken();
+            String response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .post()
+                .uri(endpoint)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+            
+            logger.info("VM guest action response: {}", response);
+            JsonNode responseNode = objectMapper.readTree(response);
+            
+            // Handle empty response (success) or error
+            if (responseNode.has("error")) {
+                JsonNode error = responseNode.get("error");
+                String errorMessage = error.path("message").asText("Unknown error");
+                throw new RuntimeException("vAPI error: " + errorMessage);
+            }
+            
+            return responseNode;
+        } catch (Exception e) {
+            logger.error("Failed to invoke VM guest action: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to invoke VM guest action: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Invokes a VM migration (relocate) using the vAPI protocol.
+     * 
+     * @param vmId The ID of the virtual machine
+     * @param spec The migration specification
+     * @return JsonNode containing the operation result
+     */
+    private JsonNode invokeVmRelocate(String vmId, ObjectNode spec) {
+        try {
+            String endpoint = "/api/vcenter/vm/" + vmId + "/action/relocate";
+            logger.info("Invoking VM migration on VM {} to host {}", vmId, spec.get("host").asText());
+            
+            String sessionToken = getValidSessionToken();
+            String requestBody = objectMapper.writeValueAsString(spec);
+            
+            String response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .post()
+                .uri(endpoint)
+                .bodyValue(requestBody)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+            
+            logger.info("VM migration response: {}", response);
+            JsonNode responseNode = objectMapper.readTree(response);
+            
+            // Handle empty response (success) or error
+            if (responseNode.has("error")) {
+                JsonNode error = responseNode.get("error");
+                String errorMessage = error.path("message").asText("Unknown error");
+                throw new RuntimeException("vAPI error: " + errorMessage);
+            }
+            
+            return responseNode;
+        } catch (Exception e) {
+            logger.error("Failed to invoke VM migration: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to invoke VM migration: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Invokes a VM get operation using the vAPI protocol.
+     * 
+     * @param vmId The ID of the virtual machine
+     * @return JsonNode containing detailed VM information
+     */
+    private JsonNode invokeVmGet(String vmId) {
+        try {
+            String endpoint = "/api/vcenter/vm?filter.vms=" + vmId;
+            logger.info("Getting detailed information for VM {}", vmId);
+            
+            String sessionToken = getValidSessionToken();
+            String response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .get()
+                .uri(endpoint)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+            
+            logger.info("VM get response: {}", response);
+            JsonNode responseNode = objectMapper.readTree(response);
+            
+            // Handle error or return results
+            if (responseNode.has("error")) {
+                JsonNode error = responseNode.get("error");
+                String errorMessage = error.path("message").asText("Unknown error");
+                throw new RuntimeException("vAPI error: " + errorMessage);
+            }
+            
+            return responseNode;
+        } catch (Exception e) {
+            logger.error("Failed to get VM details: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to get VM details: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
      * Maps vAPI service names to their corresponding vCenter API endpoints.
      * 
      * This method converts the VMware SDK-style service names to the actual
@@ -607,6 +1045,14 @@ public class VapiClient {
                 return "/api/vcenter/resource-pool";
             case "com.vmware.vcenter.VM":
                 return "/api/vcenter/vm";
+            case "com.vmware.vcenter.Datacenter":
+                return "/api/vcenter/datacenter";
+            case "com.vmware.vcenter.Host":
+                return "/api/vcenter/host";
+            case "com.vmware.vcenter.Datastore":
+                return "/api/vcenter/datastore";
+            case "com.vmware.appliance.system.Version":
+                return "/api/appliance/system/version";
             default:
                 throw new RuntimeException("Unknown vAPI service: " + service);
         }
