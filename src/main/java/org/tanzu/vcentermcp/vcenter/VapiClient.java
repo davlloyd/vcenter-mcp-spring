@@ -523,15 +523,20 @@ public class VapiClient {
                     getEndpoint = endpoint + "?datastores=" + input.get("datastore").asText();
                 }
                 
-                response = webClient.mutate()
-                    .defaultHeader("vmware-api-session-id", sessionToken)
-                    .build()
-                    .get()
-                    .uri(getEndpoint)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-                logger.info("vAPI GET request for get operation to {}", getEndpoint);
+                try {
+                    response = webClient.mutate()
+                        .defaultHeader("vmware-api-session-id", sessionToken)
+                        .build()
+                        .get()
+                        .uri(getEndpoint)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .block();
+                    logger.info("vAPI GET request for get operation to {}", getEndpoint);
+                } catch (org.springframework.web.reactive.function.client.WebClientException e) {
+                    logger.error("Connection error when calling version endpoint: {}", e.getMessage(), e);
+                    throw new RuntimeException("Connection issue when retrieving version information. Please ensure the vCenter server is accessible: " + e.getMessage(), e);
+                }
             } else {
                 // Use POST for other operations
                 // Create vAPI request structure
@@ -555,6 +560,13 @@ public class VapiClient {
             }
             
             logger.info("vAPI raw response: {}", response);
+            
+            // Handle empty or null responses
+            if (response == null || response.trim().isEmpty()) {
+                logger.warn("Empty response received from vAPI endpoint: {}", endpoint);
+                // Return an empty JSON object for empty responses
+                response = "{}";
+            }
             
             JsonNode responseNode = objectMapper.readTree(response);
             logger.info("vAPI response structure: {}", responseNode.toString());

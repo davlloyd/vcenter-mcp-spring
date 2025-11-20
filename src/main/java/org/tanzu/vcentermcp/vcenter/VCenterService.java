@@ -333,25 +333,55 @@ public class VCenterService {
             logger.info("Making vAPI call to get version information from vCenter");
             JsonNode versionNode = vapiClient.appliance().getVersion();
             
-            // Parse version information
+            // Parse version information - handle different response formats
             String version = "";
             String build = "";
             String vendor = "VMware";
             
-            if (versionNode.isObject()) {
+            if (versionNode != null && versionNode.isObject()) {
+                // Try different possible field names and structures
                 if (versionNode.has("version")) {
                     version = versionNode.get("version").asText();
+                } else if (versionNode.has("value") && versionNode.get("value").has("version")) {
+                    version = versionNode.get("value").get("version").asText();
                 }
+                
                 if (versionNode.has("build")) {
                     build = versionNode.get("build").asText();
+                } else if (versionNode.has("value") && versionNode.get("value").has("build")) {
+                    build = versionNode.get("value").get("build").asText();
                 }
+                
+                // Log the full response for debugging
+                logger.debug("Version response structure: {}", versionNode.toString());
+            } else {
+                logger.warn("Version response is not a valid object: {}", versionNode != null ? versionNode.toString() : "null");
             }
             
-            logger.info("Retrieved vCenter version: {}", version);
+            if (version.isEmpty() && build.isEmpty()) {
+                logger.warn("Could not parse version information from response. Response: {}", versionNode != null ? versionNode.toString() : "null");
+                // Return a default response rather than failing
+                return new VersionInfo("Unknown", "Unknown", vendor);
+            }
+            
+            logger.info("Retrieved vCenter version: {} (build: {})", version, build);
             return new VersionInfo(version, build, vendor);
         } catch (Exception e) {
             logger.error("Failed to retrieve version information via vAPI: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to retrieve version information: " + e.getMessage(), e);
+            // Provide a more user-friendly error message
+            String errorMessage = "Unable to retrieve version information. ";
+            if (e.getMessage() != null) {
+                if (e.getMessage().contains("401") || e.getMessage().contains("Unauthorized")) {
+                    errorMessage += "Authentication failed. Please check vCenter credentials.";
+                } else if (e.getMessage().contains("Connection") || e.getMessage().contains("timeout")) {
+                    errorMessage += "Connection issue. Please ensure the vCenter server is accessible.";
+                } else {
+                    errorMessage += "Error: " + e.getMessage();
+                }
+            } else {
+                errorMessage += "Please ensure that the vCenter server is accessible and try again later.";
+            }
+            throw new RuntimeException(errorMessage, e);
         }
     }
 
