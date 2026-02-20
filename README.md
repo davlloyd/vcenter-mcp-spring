@@ -171,11 +171,11 @@ vcenter.insecure=${VCENTER_INSECURE:true}
    mvn clean package -DskipTests
    ```
 
-4. **Push the app** (this creates the app on Cloud Foundry)
+4. **Push the app** (this creates the app on Cloud Foundry with no public route)
    ```bash
-   cf push -f manifest.yml
+   cf push -f manifest.yml --no-route
    ```
-   The app name is set in `manifest.yml` (e.g. `vcenter-mcp-server`). The push creates the app, stages the buildpack, and binds the `vcenter-service` instance listed under `services:` in the manifest.
+   The `--no-route` flag ensures the app is not routable (private network only); it has no public HTTP route and is reachable only via the platform’s internal networking (e.g. by apps that bind the service). The app name is set in `manifest.yml` (e.g. `vcenter-mcp-server`). The push creates the app, stages the buildpack, and binds the `vcenter-service` instance listed under `services:` in the manifest.
 
 5. **Restage so the binding is applied** (if you created the user-provided service after the first push)
    ```bash
@@ -188,7 +188,7 @@ vcenter.insecure=${VCENTER_INSECURE:true}
    cf logs vcenter-mcp-server --recent
    ```
 
-   For **publishing this app to the Tanzu Platform marketplace**, the app must be created on the **private network** (no public route). See [Publishing to the Tanzu Platform Marketplace (10.3)](#publishing-to-the-tanzu-platform-marketplace-103) and use `cf push -f manifest.yml --no-route` when following that procedure.
+   For **publishing this app to the Tanzu Platform marketplace**, follow [Publishing to the Tanzu Platform Marketplace (10.3)](#publishing-to-the-tanzu-platform-marketplace-103); that procedure also uses `cf push -f manifest.yml --no-route`.
 
 ## Publishing to the Tanzu Platform Marketplace (10.3)
 
