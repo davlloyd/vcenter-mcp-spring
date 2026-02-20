@@ -152,13 +152,49 @@ vcenter.insecure=${VCENTER_INSECURE:true}
 
 ### Cloud Foundry Deployment
 
-1. Build the application: `mvn clean package`
-2. Deploy to Cloud Foundry: `cf push`
-3. Bind vCenter service: `cf bind-service vcenter-mcp-server vcenter-service`
+1. **Target your foundation and select org/space**
+   ```bash
+   cf api https://api.<your-system-domain>
+   cf login
+   cf target -o <org> -s <space>
+   ```
+
+2. **Create the vCenter user-provided service** (so the app can connect to vCenter)
+   ```bash
+   cf create-user-provided-service vcenter-service \
+     -p '{"host":"vcenter.example.com","port":443,"username":"admin@vsphere.local","password":"<password>","insecure":true}'
+   ```
+   Replace `vcenter.example.com`, `admin@vsphere.local`, and `<password>` with your vCenter details.
+
+3. **Build the application**
+   ```bash
+   mvn clean package -DskipTests
+   ```
+
+4. **Push the app** (this creates the app on Cloud Foundry)
+   ```bash
+   cf push -f manifest.yml
+   ```
+   The app name is set in `manifest.yml` (e.g. `vcenter-mcp-server`). The push creates the app, stages the buildpack, and binds the `vcenter-service` instance listed under `services:` in the manifest.
+
+5. **Restage so the binding is applied** (if you created the user-provided service after the first push)
+   ```bash
+   cf restage vcenter-mcp-server
+   ```
+
+6. **Confirm the app is running**
+   ```bash
+   cf apps
+   cf logs vcenter-mcp-server --recent
+   ```
+
+   For **publishing this app to the Tanzu Platform marketplace**, the app must be created on the **private network** (no public route). See [Publishing to the Tanzu Platform Marketplace (10.3)](#publishing-to-the-tanzu-platform-marketplace-103) and use `cf push -f manifest.yml --no-route` when following that procedure.
 
 ## Publishing to the Tanzu Platform Marketplace (10.3)
 
 On **Tanzu Platform 10.3**, the vCenter MCP server can be published to the platform marketplace so other teams can consume it as a first-class service using `cf create-service` and `cf bind-service`. Publishing uses the **`cf publish-service`** command and the `service.yml` definition in this repository.
+
+**Important:** The app must be created and run on the **private network** (no public route). That way the MCP server is only reachable by apps that bind the service, via the platform’s internal networking.
 
 ### What’s in `service.yml`
 
@@ -172,62 +208,80 @@ This format is used by Tanzu Platform 10.3 when you run `cf publish-service`.
 
 ### Prerequisites
 
-- Tanzu Platform **10.3** (or compatible release that supports `cf publish-service`).
-- CF CLI targeted and logged in to your foundation.
-- The vCenter MCP app deployed (see [Cloud Foundry Deployment](#cloud-foundry-deployment)).
-- vCenter credentials available to the app (e.g. via a user-provided service bound to the app before publishing).
+- Tanzu Platform **10.3** (or a compatible release that supports `cf publish-service`).
+- CF CLI installed, targeted at your foundation, and logged in.
+- vCenter host, credentials, and port (e.g. 443) for the user-provided service.
 
-### Procedure: Publish the service to the marketplace
+### Full procedure: Create the app (private network), push, then publish
 
-1. **Build and deploy the MCP server**
+Follow these steps in order. The app is created with **no public route** so it runs only on the private network.
 
+1. **Target the foundation and select org and space**
    ```bash
-   mvn clean package -DskipTests
-   cf push -f manifest.yml
+   cf api https://api.<your-system-domain>
+   cf login
+   cf target -o <org> -s <space>
    ```
 
-   Ensure the app is running and, if it needs vCenter credentials, create and bind a user-provided service first:
-
+2. **Create the vCenter user-provided service**
+   The MCP server needs vCenter credentials at runtime. Create a user-provided service with your vCenter details:
    ```bash
    cf create-user-provided-service vcenter-service \
-     -p '{"host":"vcenter.example.com","port":443,"username":"admin@vsphere.local","password":"password","insecure":true}'
-   cf bind-service <your-mcp-app-name> vcenter-service
-   cf restage <your-mcp-app-name>
+     -p '{"host":"<vcenter-host>","port":443,"username":"<vcenter-user>","password":"<vcenter-password>","insecure":true}'
    ```
+   Replace `<vcenter-host>`, `<vcenter-user>`, and `<vcenter-password>` with your vCenter server hostname (or IP), username, and password.
 
-2. **Publish the service to the marketplace**
-
-   From the same directory that contains `service.yml`, run:
-
+3. **Build the application**
    ```bash
-   cf publish-service <your-mcp-app-name> -c service.yml
+   mvn clean package -DskipTests
    ```
 
-   Replace `<your-mcp-app-name>` with the name of the app you pushed (e.g. the app name from your `manifest.yml`). The `-c service.yml` option supplies the service definition (offering name, plans, metadata) to the marketplace.
+4. **Push the app so it is created on the private network**
+   Push the app **with no public route** so it runs only on the private network and is reachable by other apps via the platform’s internal service binding:
+   ```bash
+   cf push -f manifest.yml --no-route
+   ```
+   This command:
+   - Creates the app (name from `manifest.yml`, e.g. `vcenter-mcp-server`).
+   - Stages and runs the app with no HTTP route (private network only).
+   - Binds the `vcenter-service` instance listed under `services:` in the manifest.
+   Use the same app name in the next steps (e.g. `vcenter-mcp-server`).
 
-3. **Enable service access (if required)**
+5. **Restage the app** (so the service binding and env are applied)
+   ```bash
+   cf restage vcenter-mcp-server
+   ```
 
-   Depending on your platform configuration, you may need to enable access to the offering so orgs or spaces can see it:
+6. **Confirm the app is running**
+   ```bash
+   cf app vcenter-mcp-server
+   cf logs vcenter-mcp-server --recent
+   ```
+   The app should show no routes and be running.
 
+7. **Publish the service to the marketplace**
+   From the directory that contains `service.yml`, run:
+   ```bash
+   cf publish-service vcenter-mcp-server -c service.yml
+   ```
+   This registers the running app as the **vcenter-mcp-service** offering in the Tanzu marketplace using the plans and metadata from `service.yml`.
+
+8. **Enable service access** (so orgs/spaces can see the offering)
    ```bash
    cf enable-service-access vcenter-mcp-service -p standard
    ```
-
-   To enable all plans:
-
+   To enable all plans for the offering:
    ```bash
    cf enable-service-access vcenter-mcp-service
    ```
 
-4. **Verify in the marketplace**
-
+9. **Verify the offering in the marketplace**
    ```bash
    cf marketplace
    ```
+   You should see **vcenter-mcp-service** (or the display name **vCenter AI Tools**) and the **standard** plan.
 
-   You should see **vcenter-mcp-service** (or the display name **vCenter AI Tools**) and the **standard** plan listed.
-
-After this, the offering appears in the Tanzu Platform marketplace (e.g. in Apps Manager). Users can create and bind the service to their applications.
+After this, the offering appears in the Tanzu Platform marketplace (e.g. in Apps Manager). Users create and bind the service to their apps; the platform provides the MCP server endpoint over the private network via the binding.
 
 ### Consuming the service after it’s published
 
@@ -250,16 +304,24 @@ Developers can use the service from the marketplace with standard CF commands:
 
 ### Updating the marketplace listing
 
-To change the description, plans, or metadata shown in the marketplace:
+**To change the description, plans, or metadata** (what users see in the marketplace):
 
 1. Edit `service.yml` (e.g. `description`, `metadata.displayName`, `metadata.longDescription`, `plans`).
 2. Run `cf publish-service` again with the updated file:
-
    ```bash
-   cf publish-service <your-mcp-app-name> -c service.yml
+   cf publish-service vcenter-mcp-server -c service.yml
    ```
-
 3. If your platform requires it, run `cf enable-service-access` again for the offering or plan.
+
+**To redeploy the app** (e.g. after a new build) while keeping it on the private network:
+
+1. Build and push again with no route:
+   ```bash
+   mvn clean package -DskipTests
+   cf push -f manifest.yml --no-route
+   cf restage vcenter-mcp-server
+   ```
+2. Re-run `cf publish-service vcenter-mcp-server -c service.yml` if the platform requires re-publishing after app updates.
 
 ## Authentication
 
