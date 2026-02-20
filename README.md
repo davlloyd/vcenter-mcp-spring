@@ -7,6 +7,7 @@ A Spring Boot-based Model Context Protocol (MCP) server that provides read-only 
 - **vCenter Integration**: Connect to VMware vCenter Server using vAPI
 - **MCP Tools**: Expose vCenter operations as MCP tools for AI assistants
 - **Cloud Foundry Ready**: Deployable to Cloud Foundry with service binding
+- **Tanzu Marketplace (10.3)**: Publish to the platform marketplace with `cf publish-service` and `service.yml` (see [Publishing to the Tanzu Platform Marketplace (10.3)](#publishing-to-the-tanzu-platform-marketplace-103))
 - **VMware SDK-Style**: Follows VMware SDK patterns for consistency
 - **VM Management**: Read operations for inventory and write operations for VM power and migration control
 
@@ -154,6 +155,111 @@ vcenter.insecure=${VCENTER_INSECURE:true}
 1. Build the application: `mvn clean package`
 2. Deploy to Cloud Foundry: `cf push`
 3. Bind vCenter service: `cf bind-service vcenter-mcp-server vcenter-service`
+
+## Publishing to the Tanzu Platform Marketplace (10.3)
+
+On **Tanzu Platform 10.3**, the vCenter MCP server can be published to the platform marketplace so other teams can consume it as a first-class service using `cf create-service` and `cf bind-service`. Publishing uses the **`cf publish-service`** command and the `service.yml` definition in this repository.
+
+### What’s in `service.yml`
+
+The `service.yml` file defines the marketplace offering:
+
+- **Offering identity**: `name` (`vcenter-mcp-service`), `description`, and `metadata` (display name, long description, provider, documentation URL).
+- **Tags**: e.g. `mcp`, `ai-tools` so users can find the offering in the catalog.
+- **Plans**: e.g. a `standard` plan (free) with description and bullets.
+
+This format is used by Tanzu Platform 10.3 when you run `cf publish-service`.
+
+### Prerequisites
+
+- Tanzu Platform **10.3** (or compatible release that supports `cf publish-service`).
+- CF CLI targeted and logged in to your foundation.
+- The vCenter MCP app deployed (see [Cloud Foundry Deployment](#cloud-foundry-deployment)).
+- vCenter credentials available to the app (e.g. via a user-provided service bound to the app before publishing).
+
+### Procedure: Publish the service to the marketplace
+
+1. **Build and deploy the MCP server**
+
+   ```bash
+   mvn clean package -DskipTests
+   cf push -f manifest.yml
+   ```
+
+   Ensure the app is running and, if it needs vCenter credentials, create and bind a user-provided service first:
+
+   ```bash
+   cf create-user-provided-service vcenter-service \
+     -p '{"host":"vcenter.example.com","port":443,"username":"admin@vsphere.local","password":"password","insecure":true}'
+   cf bind-service <your-mcp-app-name> vcenter-service
+   cf restage <your-mcp-app-name>
+   ```
+
+2. **Publish the service to the marketplace**
+
+   From the same directory that contains `service.yml`, run:
+
+   ```bash
+   cf publish-service <your-mcp-app-name> -c service.yml
+   ```
+
+   Replace `<your-mcp-app-name>` with the name of the app you pushed (e.g. the app name from your `manifest.yml`). The `-c service.yml` option supplies the service definition (offering name, plans, metadata) to the marketplace.
+
+3. **Enable service access (if required)**
+
+   Depending on your platform configuration, you may need to enable access to the offering so orgs or spaces can see it:
+
+   ```bash
+   cf enable-service-access vcenter-mcp-service -p standard
+   ```
+
+   To enable all plans:
+
+   ```bash
+   cf enable-service-access vcenter-mcp-service
+   ```
+
+4. **Verify in the marketplace**
+
+   ```bash
+   cf marketplace
+   ```
+
+   You should see **vcenter-mcp-service** (or the display name **vCenter AI Tools**) and the **standard** plan listed.
+
+After this, the offering appears in the Tanzu Platform marketplace (e.g. in Apps Manager). Users can create and bind the service to their applications.
+
+### Consuming the service after it’s published
+
+Developers can use the service from the marketplace with standard CF commands:
+
+1. **Create a service instance**
+
+   ```bash
+   cf create-service vcenter-mcp-service standard my-vcenter-mcp
+   ```
+
+2. **Bind the instance to an application**
+
+   ```bash
+   cf bind-service <app-name> my-vcenter-mcp
+   cf restage <app-name>
+   ```
+
+3. The app receives binding details (e.g. in `VCAP_SERVICES`), including the MCP server endpoint and any credentials the platform injects, and can connect to the vCenter MCP tools.
+
+### Updating the marketplace listing
+
+To change the description, plans, or metadata shown in the marketplace:
+
+1. Edit `service.yml` (e.g. `description`, `metadata.displayName`, `metadata.longDescription`, `plans`).
+2. Run `cf publish-service` again with the updated file:
+
+   ```bash
+   cf publish-service <your-mcp-app-name> -c service.yml
+   ```
+
+3. If your platform requires it, run `cf enable-service-access` again for the offering or plan.
 
 ## Authentication
 

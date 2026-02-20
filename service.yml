@@ -10,8 +10,7 @@ metadata:
   displayName: "vCenter AI Tools"
   longDescription: "Provides LLMs with secure access to vCenter inventory, VM power states, and metrics via natural language."
   providerDisplayName: "Platform Engineering"
-  documentationUrl: "https://your-internal-wiki.local/docs/vcenter-mcp"
-  supportUrl: "https://helpdesk.local/ai-tools"
+  documentationUrl: "https://github.com/davlloyd/vcenter-mcp-spring"
 plans:
   - name: standard
     description: "Standard shared access to the vCenter MCP server."
@@ -19,5 +18,5 @@ plans:
     metadata:
       displayName: "Standard Plan"
       bullets:
-        - "Read-only access to vCenter inventory"
+        - "Read-only access to vCenter inventory and simple VM operations"
         - "Shared rate limits"
