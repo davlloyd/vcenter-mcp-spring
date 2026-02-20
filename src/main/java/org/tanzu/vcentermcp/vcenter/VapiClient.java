@@ -2,11 +2,14 @@ package org.tanzu.vcentermcp.vcenter;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.tanzu.vcentermcp.config.VCenterConfig;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -399,7 +402,19 @@ public class VapiClient {
             logger.info("=== VAPI HOST SERVICE: list() ===");
             return invokeVapiMethod("com.vmware.vcenter.Host", "list", null);
         }
+
+        /**
+         * Gets detailed information for a specific host.
+         *
+         * @param hostId Host identifier (e.g. host-23)
+         * @return JsonNode containing host details
+         */
+        public JsonNode get(String hostId) {
+            logger.info("=== VAPI HOST SERVICE: get({}) ===", hostId);
+            return invokeHostGet(hostId);
+        }
     }
+
     
     /**
      * Service interface for datastore operations.
@@ -442,11 +457,76 @@ public class VapiClient {
         /**
          * Gets the vCenter version information.
          * 
+         * This method tries multiple endpoints to get version information:
+         * 1. vAPI endpoint: /api/appliance/system/version
+         * 2. REST API endpoint: /rest/appliance/system/version
+         * 
+         * If both fail with 404, throws a RuntimeException that can be caught and handled gracefully.
+         * 
          * @return JsonNode containing the version information
+         * @throws RuntimeException if version endpoint is not available (404) or other errors occur
          */
         public JsonNode getVersion() {
             logger.info("=== VAPI APPLIANCE SERVICE: getVersion() ===");
-            return invokeVapiMethod("com.vmware.appliance.system.Version", "get", null);
+            
+            // Try vAPI endpoint first
+            try {
+                return invokeVapiMethod("com.vmware.appliance.system.Version", "get", null);
+            } catch (Exception e) {
+                if (e.getMessage() != null && (e.getMessage().contains("404") || e.getMessage().contains("Not Found"))) {
+                    logger.warn("vAPI version endpoint returned 404, trying REST API endpoint");
+                    // Try REST API endpoint as fallback
+                    try {
+                        return invokeRestVersionEndpoint();
+                    } catch (Exception restException) {
+                        if (restException.getMessage() != null && (restException.getMessage().contains("404") || restException.getMessage().contains("Not Found"))) {
+                            logger.warn("REST API version endpoint also returned 404. Version endpoint may not be available on this vCenter instance.");
+                            // Re-throw with a clear message that this is a 404
+                            throw new RuntimeException("404 Not Found - Version endpoint not available on this vCenter instance", restException);
+                        }
+                        throw restException;
+                    }
+                }
+                throw e;
+            }
+        }
+        
+        /**
+         * Invokes the REST API version endpoint as a fallback.
+         * 
+         * @return JsonNode containing the version information
+         */
+        private JsonNode invokeRestVersionEndpoint() {
+            try {
+                String endpoint = "/rest/appliance/system/version";
+                logger.info("Trying REST API version endpoint: {}", endpoint);
+                
+                String sessionToken = getValidSessionToken();
+                String response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .get()
+                    .uri(endpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+                
+                logger.info("REST API version response: {}", response);
+                JsonNode responseNode = objectMapper.readTree(response);
+                
+                // REST API might return data in "value" field
+                if (responseNode.has("value")) {
+                    return responseNode.get("value");
+                }
+                
+                return responseNode;
+            } catch (org.springframework.web.reactive.function.client.WebClientResponseException.NotFound e) {
+                logger.warn("REST API version endpoint returned 404: {}", e.getMessage());
+                throw new RuntimeException("404 Not Found - Version endpoint not available", e);
+            } catch (Exception e) {
+                logger.error("Failed to get version from REST API endpoint: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to get version information from REST endpoint: " + e.getMessage(), e);
+            }
         }
     }
     
@@ -510,20 +590,77 @@ public class VapiClient {
                     .block();
                 logger.info("vAPI GET request to {}", finalEndpoint);
             } else if ("get".equals(operation)) {
-                // Use GET for get operations - for version and other simple get operations
+                // Handle get operations - some use GET, some use POST
                 String sessionToken = getValidSessionToken();
-                String getEndpoint = endpoint;
                 
                 // Handle specific get operations
                 if (service.equals("com.vmware.appliance.system.Version")) {
                     // Version is a simple GET request
-                    getEndpoint = endpoint;
+                    String getEndpoint = endpoint;
+                    try {
+                        response = webClient.mutate()
+                            .defaultHeader("vmware-api-session-id", sessionToken)
+                            .build()
+                            .get()
+                            .uri(getEndpoint)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .block();
+                        logger.info("vAPI GET request for version to {}", getEndpoint);
+                    } catch (org.springframework.web.reactive.function.client.WebClientException e) {
+                        logger.error("Connection error when calling version endpoint: {}", e.getMessage(), e);
+                        throw new RuntimeException("Connection issue when retrieving version information. Please ensure the vCenter server is accessible: " + e.getMessage(), e);
+                    }
                 } else if (input != null && input.has("datastore")) {
                     // Datastore get requires the datastore ID as a query parameter
-                    getEndpoint = endpoint + "?datastores=" + input.get("datastore").asText();
-                }
-                
-                try {
+                    String getEndpoint = endpoint + "?datastores=" + input.get("datastore").asText();
+                    response = webClient.mutate()
+                        .defaultHeader("vmware-api-session-id", sessionToken)
+                        .build()
+                        .get()
+                        .uri(getEndpoint)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .block();
+                    logger.info("vAPI GET request for datastore get to {}", getEndpoint);
+                } else if (service.equals("com.vmware.vcenter.VM") && input != null && input.has("vm")) {
+                    // VM get: Try POST with vAPI method pattern first (for detailed info), fallback to GET with filter
+                    String vmId = input.get("vm").asText();
+                    
+                    // Try POST with vAPI method pattern for more detailed information
+                    try {
+                        requestBody = objectMapper.writeValueAsString(input);
+                        logger.info("vAPI POST request for VM get (detailed) to {} with body: {}", endpoint, requestBody);
+                        
+                        response = webClient.mutate()
+                            .defaultHeader("vmware-api-session-id", sessionToken)
+                            .build()
+                            .post()
+                            .uri(endpoint)
+                            .bodyValue(requestBody)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .block();
+                        logger.info("vAPI POST response for VM get (detailed): {}", response);
+                    } catch (Exception e) {
+                        // If POST fails, fallback to GET with filter parameter
+                        logger.warn("POST method for VM get failed: {}, falling back to GET with filter", e.getMessage());
+                        String getEndpoint = endpoint + "?filter.vms=" + vmId;
+                        logger.info("vAPI GET request for VM get to {}", getEndpoint);
+                        
+                        response = webClient.mutate()
+                            .defaultHeader("vmware-api-session-id", sessionToken)
+                            .build()
+                            .get()
+                            .uri(getEndpoint)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .block();
+                        logger.info("vAPI GET response for VM get: {}", response);
+                    }
+                } else {
+                    // Default: use GET for other get operations
+                    String getEndpoint = endpoint;
                     response = webClient.mutate()
                         .defaultHeader("vmware-api-session-id", sessionToken)
                         .build()
@@ -533,9 +670,6 @@ public class VapiClient {
                         .bodyToMono(String.class)
                         .block();
                     logger.info("vAPI GET request for get operation to {}", getEndpoint);
-                } catch (org.springframework.web.reactive.function.client.WebClientException e) {
-                    logger.error("Connection error when calling version endpoint: {}", e.getMessage(), e);
-                    throw new RuntimeException("Connection issue when retrieving version information. Please ensure the vCenter server is accessible: " + e.getMessage(), e);
                 }
             } else {
                 // Use POST for other operations
@@ -547,16 +681,16 @@ public class VapiClient {
                 requestBody = objectMapper.writeValueAsString(request);
                 logger.info("vAPI request body: {}", requestBody);
                 String sessionToken = getValidSessionToken();
-            
-            response = webClient.mutate()
-                .defaultHeader("vmware-api-session-id", sessionToken)
-                .build()
-                .post()
-                .uri(endpoint)
-                .bodyValue(requestBody)
-                .retrieve()
-                .bodyToMono(String.class)
-                .block();
+
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", sessionToken)
+                    .build()
+                    .post()
+                    .uri(endpoint)
+                    .bodyValue(requestBody)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
             }
             
             logger.info("vAPI raw response: {}", response);
@@ -597,6 +731,11 @@ public class VapiClient {
             }
             
             return result;
+        } catch (org.springframework.web.reactive.function.client.WebClientException e) {
+            // Handle connection errors specifically
+            logger.error("Connection error when calling vAPI method {}.{}: {}", service, operation, e.getMessage(), e);
+            String errorMessage = "Connection issue when calling vCenter API. Please ensure the vCenter server is accessible: " + e.getMessage();
+            throw new RuntimeException(errorMessage, e);
         } catch (Exception e) {
             // Check if this is a 401 Unauthorized error, which indicates session token is invalid
             if (e.getMessage() != null && e.getMessage().contains("401 Unauthorized")) {
@@ -804,6 +943,28 @@ public class VapiClient {
                     .bodyToMono(String.class)
                     .block();
                 logger.info("vAPI retry GET request to {}", finalEndpoint);
+            } else if ("get".equals(operation)) {
+                // Use GET for get operations
+                String getEndpoint = endpoint;
+                
+                // Handle specific get operations
+                if (service.equals("com.vmware.appliance.system.Version")) {
+                    // Version is a simple GET request
+                    getEndpoint = endpoint;
+                } else if (input != null && input.has("datastore")) {
+                    // Datastore get requires the datastore ID as a query parameter
+                    getEndpoint = endpoint + "?datastores=" + input.get("datastore").asText();
+                }
+                
+                response = webClient.mutate()
+                    .defaultHeader("vmware-api-session-id", freshSessionToken)
+                    .build()
+                    .get()
+                    .uri(getEndpoint)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+                logger.info("vAPI retry GET request for get operation to {}", getEndpoint);
             } else {
                 // Use POST for other operations
                 // Create vAPI request structure
@@ -873,50 +1034,151 @@ public class VapiClient {
      * @return JsonNode containing the operation result
      */
     private JsonNode invokeVmAction(String vmId, String action, ObjectNode spec) {
+        String apiEndpoint = "/api/vcenter/vm/" + vmId + "/power/" + action;
         try {
-            String endpoint = "/api/vcenter/vm/" + vmId + "/power/" + action;
-            logger.info("Invoking VM power action: {} on VM {}", action, vmId);
-            
-            String sessionToken = getValidSessionToken();
-            String response;
-            
-            if (spec != null && !spec.isEmpty()) {
-                String requestBody = objectMapper.writeValueAsString(spec);
-                response = webClient.mutate()
-                    .defaultHeader("vmware-api-session-id", sessionToken)
-                    .build()
-                    .post()
-                    .uri(endpoint)
-                    .bodyValue(requestBody)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-            } else {
-                response = webClient.mutate()
-                    .defaultHeader("vmware-api-session-id", sessionToken)
-                    .build()
-                    .post()
-                    .uri(endpoint)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+            return executeVmPowerRequest(vmId, action, apiEndpoint, spec, "vAPI");
+        } catch (WebClientResponseException e) {
+            if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
+                logger.warn("vAPI power endpoint returned 404 for VM {} action {}. Trying REST endpoint.", vmId, action);
+                String restEndpoint = "/rest/vcenter/vm/" + vmId + "/power/" + action;
+                try {
+                    return executeVmPowerRequest(vmId, action, restEndpoint, spec, "REST");
+                } catch (Exception restException) {
+                    logger.error("REST power endpoint also failed: {}", restException.getMessage(), restException);
+                    throw new RuntimeException("Failed to invoke VM power action via REST endpoint: " + restException.getMessage(), restException);
+                }
             }
-            
-            logger.info("VM power action response: {}", response);
-            JsonNode responseNode = objectMapper.readTree(response);
-            
-            // Handle empty response (success) or error
-            if (responseNode.has("error")) {
-                JsonNode error = responseNode.get("error");
-                String errorMessage = error.path("message").asText("Unknown error");
-                throw new RuntimeException("vAPI error: " + errorMessage);
-            }
-            
-            return responseNode;
+            logger.error("VM power action failed with HTTP status {}: {}", e.getStatusCode(), e.getMessage());
+            throw new RuntimeException("Failed to invoke VM power action: " + e.getMessage(), e);
         } catch (Exception e) {
             logger.error("Failed to invoke VM power action: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to invoke VM power action: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Fetches detailed information for a single host (e.g. product version, hardware).
+     * Tries the native vAPI host endpoint first, then falls back to locating the host
+     * in the list response.
+     *
+     * @param hostId vCenter host ID (e.g. host-23)
+     * @return JsonNode with host details (possibly from list payload)
+     * @throws RuntimeException if the host cannot be found or details cannot be retrieved
+     */
+    private JsonNode invokeHostGet(String hostId) {
+        try {
+            // Attempt native vAPI endpoint which returns Host.Info (includes product data)
+            JsonNode apiResult = tryHostDetailsEndpoint(hostId, "/api/vcenter/host/" + hostId, "vAPI");
+            if (apiResult != null) {
+                return apiResult;
+            }
+
+            // Fall back to list response and locate host
+            JsonNode hosts = hosts().list();
+            if (hosts != null && hosts.isArray()) {
+                for (JsonNode host : hosts) {
+                    if (host.has("host") && hostId.equals(host.get("host").asText())) {
+                        return host;
+                    }
+                }
+            }
+
+            throw new RuntimeException("Host not found");
+        } catch (Exception e) {
+            logger.error("Failed to get host details for {}: {}", hostId, e.getMessage());
+            throw new RuntimeException("Failed to get host details: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Attempts to load host details from a specific REST endpoint.
+     * Unwraps a top-level "value" field if present. Returns null on any failure.
+     *
+     * @param hostId host ID (for logging)
+     * @param endpoint full path (e.g. /api/vcenter/host/{id})
+     * @param label label for logs (e.g. "vAPI")
+     * @return host data node or null
+     */
+    private JsonNode tryHostDetailsEndpoint(String hostId, String endpoint, String label) {
+        try {
+            logger.info("Trying {} endpoint for host {}: {}", label, hostId, endpoint);
+            String sessionToken = getValidSessionToken();
+            String response = webClient.mutate()
+                .defaultHeader("vmware-api-session-id", sessionToken)
+                .build()
+                .get()
+                .uri(endpoint)
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+
+            if (response == null || response.isBlank()) {
+                logger.warn("{} endpoint returned empty response for host {}", label, hostId);
+                return null;
+            }
+
+            JsonNode root = objectMapper.readTree(response);
+            JsonNode valueNode = root.has("value") ? root.get("value") : root;
+            logger.info("{} endpoint returned host data keys: {}", label,
+                valueNode != null && valueNode.isObject() ? valueNode.fieldNames() : "n/a");
+            return valueNode != null && !valueNode.isMissingNode() ? valueNode : null;
+        } catch (Exception e) {
+            logger.warn("{} endpoint failed for host {}: {}", label, hostId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Sends a POST request to a VM power endpoint (vAPI or REST).
+     * Empty or blank response body is treated as success.
+     *
+     * @param vmId VM ID
+     * @param action action name (e.g. start, stop)
+     * @param endpoint full path to the power action
+     * @param spec optional JSON body (may be null)
+     * @param label label for logging
+     * @return response as JsonNode or empty object for empty response
+     * @throws Exception on HTTP or parsing errors
+     */
+    private JsonNode executeVmPowerRequest(String vmId, String action, String endpoint, ObjectNode spec, String label) throws Exception {
+        logger.info("Invoking {} VM power action '{}' on VM {}", label, action, vmId);
+        String sessionToken = getValidSessionToken();
+        String response;
+
+        WebClient.RequestBodyUriSpec baseRequest = webClient.mutate()
+            .defaultHeader("vmware-api-session-id", sessionToken)
+            .build()
+            .post();
+
+        WebClient.RequestHeadersSpec<?> requestSpec;
+        if (spec != null && !spec.isEmpty()) {
+            String requestBody = objectMapper.writeValueAsString(spec);
+            requestSpec = baseRequest.uri(endpoint).bodyValue(requestBody);
+        } else {
+            requestSpec = baseRequest.uri(endpoint);
+        }
+
+        response = requestSpec
+            .retrieve()
+            .bodyToMono(String.class)
+            .block();
+
+        logger.info("VM power action response from {}: {}", label, response);
+
+        if (response == null || response.isBlank()) {
+            logger.info("Empty response from {} endpoint indicates success", label);
+            return objectMapper.createObjectNode();
+        }
+
+        JsonNode responseNode = objectMapper.readTree(response);
+        
+        if (responseNode.has("error")) {
+            JsonNode error = responseNode.get("error");
+            String errorMessage = error.path("message").asText("Unknown error");
+            throw new RuntimeException(label + " endpoint error: " + errorMessage);
+        }
+
+        return responseNode;
     }
     
     /**
@@ -1008,9 +1270,48 @@ public class VapiClient {
      */
     private JsonNode invokeVmGet(String vmId) {
         try {
-            String endpoint = "/api/vcenter/vm?filter.vms=" + vmId;
-            logger.info("Getting detailed information for VM {}", vmId);
+            logger.info("=== invokeVmGet called for VM ID: {} ===", vmId);
             
+            // Try the native vAPI endpoint that includes placement information
+            JsonNode apiResult = tryVmDetailsEndpoint(vmId, "/api/vcenter/vm/" + vmId, "vAPI");
+            if (apiResult != null) {
+                return apiResult;
+            }
+
+            // Try REST fallback
+            JsonNode restResult = tryVmDetailsEndpoint(vmId, "/rest/vcenter/vm/" + vmId, "REST");
+            if (restResult != null) {
+                return restResult;
+            }
+            
+            // Fallback to vAPI method pattern: com.vmware.vcenter.VM.get with VM ID in request body
+            ObjectNode input = objectMapper.createObjectNode();
+            input.put("vm", vmId);
+            logger.info("Calling invokeVapiMethod with service=com.vmware.vcenter.VM, operation=get, input={}", input.toString());
+            
+            JsonNode result = invokeVapiMethod("com.vmware.vcenter.VM", "get", input);
+            logger.info("invokeVapiMethod returned result: {}", result != null ? result.toString() : "null");
+            return result;
+        } catch (Exception e) {
+            logger.error("Failed to get VM details in invokeVmGet for VM {}: {}", vmId, e.getMessage(), e);
+            logger.error("Exception type: {}, cause: {}", e.getClass().getName(), e.getCause() != null ? e.getCause().getMessage() : "none");
+            throw new RuntimeException("Failed to get VM details: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Attempts to load VM details from a specific REST endpoint.
+     * Normalizes the response to an array of one element (for consistent parsing).
+     * Unwraps a top-level "value" field if present. Returns null on failure or empty data.
+     *
+     * @param vmId VM ID (for logging)
+     * @param endpoint full path (e.g. /api/vcenter/vm/{id})
+     * @param label label for logs (e.g. "vAPI")
+     * @return ArrayNode with one VM object or null
+     */
+    private JsonNode tryVmDetailsEndpoint(String vmId, String endpoint, String label) {
+        try {
+            logger.info("Trying {} endpoint for VM {}: {}", label, vmId, endpoint);
             String sessionToken = getValidSessionToken();
             String response = webClient.mutate()
                 .defaultHeader("vmware-api-session-id", sessionToken)
@@ -1020,21 +1321,30 @@ public class VapiClient {
                 .retrieve()
                 .bodyToMono(String.class)
                 .block();
-            
-            logger.info("VM get response: {}", response);
-            JsonNode responseNode = objectMapper.readTree(response);
-            
-            // Handle error or return results
-            if (responseNode.has("error")) {
-                JsonNode error = responseNode.get("error");
-                String errorMessage = error.path("message").asText("Unknown error");
-                throw new RuntimeException("vAPI error: " + errorMessage);
+
+            logger.info("{} endpoint response for VM {}: {}", label, vmId, response);
+            JsonNode root = objectMapper.readTree(response);
+            JsonNode valueNode = root.has("value") ? root.get("value") : root;
+
+            ArrayNode arrayNode = objectMapper.createArrayNode();
+            if (valueNode != null) {
+                if (valueNode.isArray()) {
+                    valueNode.forEach(arrayNode::add);
+                } else if (!valueNode.isNull()) {
+                    arrayNode.add(valueNode);
+                }
             }
-            
-            return responseNode;
+
+            if (arrayNode.size() > 0) {
+                logger.info("Successfully retrieved VM details via {}", label);
+                return arrayNode;
+            } else {
+                logger.warn("{} endpoint did not return VM data for {}", label, vmId);
+                return null;
+            }
         } catch (Exception e) {
-            logger.error("Failed to get VM details: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to get VM details: " + e.getMessage(), e);
+            logger.warn("{} endpoint failed for VM {}: {}", label, vmId, e.getMessage());
+            return null;
         }
     }
     

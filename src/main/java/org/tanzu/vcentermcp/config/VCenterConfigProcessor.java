@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 
@@ -34,13 +33,19 @@ public class VCenterConfigProcessor {
 
     private static final Logger logger = LoggerFactory.getLogger(VCenterConfigProcessor.class);
 
-    /** The vCenter configuration object to be updated */
-    @Autowired
-    private VCenterConfig vCenterConfig;
+    private final VCenterConfig vCenterConfig;
+    private final Environment environment;
 
-    /** Spring environment for accessing environment variables */
-    @Autowired
-    private Environment environment;
+    /**
+     * Constructs the processor with required dependencies.
+     *
+     * @param vCenterConfig vCenter configuration to update from VCAP_SERVICES when incomplete
+     * @param environment Spring environment for VCAP_SERVICES and other properties
+     */
+    public VCenterConfigProcessor(VCenterConfig vCenterConfig, Environment environment) {
+        this.vCenterConfig = vCenterConfig;
+        this.environment = environment;
+    }
 
     /**
      * Processes VCAP_SERVICES to configure vCenter connection settings.

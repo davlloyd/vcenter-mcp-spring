@@ -20,14 +20,17 @@ The server provides the following MCP tools:
 3. **`getVMsInCluster(String clusterName)`** - List VMs in a specific cluster
 4. **`getVMsInResourcePool(String resourcePoolName)`** - List VMs in a specific resource pool
 5. **`listAllVirtualMachines()`** - List ALL VMs across the entire vCenter (no parameters required)
-6. **`getVMDetails(String vmName)`** - Get detailed information about a specific virtual machine
+6. **`getVMResourceSummary(String vmName)`** - Get configured resources (CPU, RAM, guest OS) and power status for a VM
+7. **`getVMLocationDetails(String vmName)`** - Get hosting information for a VM (datacenter, cluster, resource pool, datastore, host)
+8. **`getVMResourcePool(String vmName)`** - Identify which resource pool and cluster a VM belongs to
+9. **`getHostVersion(String hostName)`** - Retrieve ESXi host version/build, vendor, and model information
 
 ### Extended Operations
-7. **`listDataCenters()`** - List all datacenters in the vCenter
-8. **`getVCenterVersion()`** - Get vCenter version information
-9. **`listDataStoresWithCapacity()`** - List all datastores with capacity and consumption information
-10. **`listClusterResources()`** - Get detailed resource information for all clusters including CPU and RAM
-11. **`listHosts()`** - List all hosts in the vCenter with their connection and power state
+10. **`listDataCenters()`** - List all datacenters in the vCenter
+11. **`getVCenterVersion()`** - Get vCenter version information
+12. **`listDataStoresWithCapacity()`** - List all datastores with capacity and consumption information
+13. **`listClusterResources()`** - Get detailed resource information for all clusters including CPU and RAM
+14. **`listHosts()`** - List all hosts in the vCenter with their connection and power state
 
 ### VM Power Management (Write Operations)
 ⚠️ **Note**: These operations require write permissions to vCenter.

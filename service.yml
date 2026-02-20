@@ -1,0 +1,23 @@
+---
+name: vcenter-mcp-service
+description: "Model Context Protocol tools for querying and managing vCenter environments."
+bindable: true
+tags:
+  - mcp
+  - ai-tools
+  - mcpStreamableURL  
+metadata:
+  displayName: "vCenter AI Tools"
+  longDescription: "Provides LLMs with secure access to vCenter inventory, VM power states, and metrics via natural language."
+  providerDisplayName: "Platform Engineering"
+  documentationUrl: "https://your-internal-wiki.local/docs/vcenter-mcp"
+  supportUrl: "https://helpdesk.local/ai-tools"
+plans:
+  - name: standard
+    description: "Standard shared access to the vCenter MCP server."
+    free: true
+    metadata:
+      displayName: "Standard Plan"
+      bullets:
+        - "Read-only access to vCenter inventory"
+        - "Shared rate limits"

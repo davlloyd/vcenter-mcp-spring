@@ -67,10 +67,10 @@ public class VCenterMcpApplication {
      * discovered and registered by Spring AI's MCP server configuration.
      * 
      * The VCenterService contains tools for:
-     * - Listing clusters in vCenter
-     * - Listing resource pools within clusters
-     * - Listing virtual machines in clusters or resource pools
-     * - Listing all virtual machines across the entire vCenter
+     * - Listing clusters, datacenters, datastores, hosts, and resource pools
+     * - VM inventory and details (resource summary, location, resource pool)
+     * - vCenter and host version information
+     * - VM power operations (power on/off, reset, restart, shutdown) and migration
      * 
      * @param vCenterService The service containing vCenter operation tools
      * @return List of ToolCallback objects representing the available MCP tools

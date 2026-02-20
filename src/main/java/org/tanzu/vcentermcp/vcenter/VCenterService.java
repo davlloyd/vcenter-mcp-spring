@@ -8,33 +8,55 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * Service class that provides MCP (Model Context Protocol) tools for vCenter operations.
- * 
- * This service acts as the bridge between the MCP server and the vCenter vAPI client.
+ *
+ * <p>This service acts as the bridge between the MCP server and the vCenter vAPI client.
  * It exposes vCenter operations as MCP tools that can be consumed by AI assistants
- * and other MCP clients. All operations are read-only and focus on listing and
- * querying vCenter resources.
- * 
- * The service provides the following MCP tools:
- * - getClusters(): Lists all clusters in the vCenter
- * - getResourcePoolsInCluster(): Lists resource pools within a specific cluster
- * - getVMsInCluster(): Lists virtual machines within a specific cluster
- * - getVMsInResourcePool(): Lists virtual machines within a specific resource pool
- * - listAllVirtualMachines(): Lists all virtual machines across the entire vCenter
- * 
- * Each tool method includes comprehensive logging for debugging and error handling
- * to provide meaningful feedback when operations fail.
- * 
- * The service also includes helper methods for name-to-ID resolution and data
- * structure classes for representing vCenter resources.
+ * and other MCP clients. Tools accept friendly names (e.g. VM name, cluster name)
+ * and resolve them to vCenter IDs internally; duplicate-name warnings are returned
+ * when applicable.
+ *
+ * <p><b>Inventory and listing:</b>
+ * <ul>
+ *   <li>{@link #getClusters()}, {@link #listDataCenters()}, {@link #listHosts()}</li>
+ *   <li>{@link #getResourcePoolsInCluster(String)}, {@link #listDataStoresWithCapacity()}, {@link #listClusterResources()}</li>
+ *   <li>{@link #getVMsInCluster(String)}, {@link #getVMsInResourcePool(String)}, {@link #listAllVirtualMachines()}</li>
+ * </ul>
+ *
+ * <p><b>VM details and placement:</b>
+ * <ul>
+ *   <li>{@link #getVMResourceSummary(String)} – configured resources and power state</li>
+ *   <li>{@link #getVMLocationDetails(String)} – datacenter, cluster, resource pool, datastore, host</li>
+ *   <li>{@link #getVMResourcePool(String)} – resource pool and cluster for a VM</li>
+ * </ul>
+ *
+ * <p><b>Version and host:</b>
+ * <ul>
+ *   <li>{@link #getVCenterVersion()}, {@link #getHostVersion(String)}</li>
+ * </ul>
+ *
+ * <p><b>VM power and migration (write operations):</b>
+ * <ul>
+ *   <li>{@link #powerOnVM(String)}, {@link #powerOffVM(String)}, {@link #resetVM(String)}</li>
+ *   <li>{@link #restartVM(String)}, {@link #shutdownVM(String)}, {@link #migrateVM(String, String)}</li>
+ * </ul>
+ *
+ * <p>Tool methods include logging and consistent error handling; name resolution
+ * uses retries with exponential backoff where appropriate.
  */
 @Service
 public class VCenterService {
 
     private static final Logger logger = LoggerFactory.getLogger(VCenterService.class);
-    
+
+    /** Maximum retries for VM details and VM name resolution when API calls are transiently failing. */
+    private static final int MAX_RETRIES = 3;
+    /** Initial delay in ms before first retry; doubled on each subsequent retry (exponential backoff). */
+    private static final int RETRY_DELAY_MS = 500;
+
     /** The vAPI client for communicating with vCenter */
     private final VapiClient vapiClient;
 
@@ -368,19 +390,29 @@ public class VCenterService {
             return new VersionInfo(version, build, vendor);
         } catch (Exception e) {
             logger.error("Failed to retrieve version information via vAPI: {}", e.getMessage(), e);
-            // Provide a more user-friendly error message
-            String errorMessage = "Unable to retrieve version information. ";
-            if (e.getMessage() != null) {
-                if (e.getMessage().contains("401") || e.getMessage().contains("Unauthorized")) {
-                    errorMessage += "Authentication failed. Please check vCenter credentials.";
-                } else if (e.getMessage().contains("Connection") || e.getMessage().contains("timeout")) {
-                    errorMessage += "Connection issue. Please ensure the vCenter server is accessible.";
-                } else {
-                    errorMessage += "Error: " + e.getMessage();
-                }
-            } else {
-                errorMessage += "Please ensure that the vCenter server is accessible and try again later.";
+            logger.error("Exception type: {}, cause: {}", e.getClass().getName(), e.getCause() != null ? e.getCause().getMessage() : "none");
+            
+            // Check if this is a 404 error (endpoint not available)
+            String errorMsg = e.getMessage() != null ? e.getMessage() : "";
+            if (errorMsg.contains("404") || errorMsg.contains("Not Found") || 
+                (e.getCause() != null && e.getCause().getMessage() != null && 
+                 (e.getCause().getMessage().contains("404") || e.getCause().getMessage().contains("Not Found")))) {
+                logger.warn("Version endpoint not available on this vCenter instance. This may be due to vCenter version or permissions.");
+                // Return a message indicating version info is not available
+                return new VersionInfo("Not Available", "Version endpoint not accessible on this vCenter instance", "VMware");
             }
+            
+            // Provide a more user-friendly error message for other errors
+            String errorMessage = "Unable to retrieve version information. ";
+            if (errorMsg.contains("401") || errorMsg.contains("Unauthorized")) {
+                errorMessage += "Authentication failed. Please check vCenter credentials.";
+            } else if (errorMsg.contains("Connection") || errorMsg.contains("timeout") || 
+                       errorMsg.contains("Connection issue")) {
+                errorMessage += "Connection issue. Please ensure the vCenter server is accessible.";
+            } else {
+                errorMessage += "Error: " + errorMsg;
+            }
+            errorMessage += " Please ensure that the vCenter server is accessible and try again later.";
             throw new RuntimeException(errorMessage, e);
         }
     }
@@ -530,144 +562,392 @@ public class VCenterService {
     }
 
     /**
-     * MCP tool: Gets detailed information about a specific virtual machine.
-     * 
-     * This tool retrieves detailed information about a VM identified by its name.
-     * The information includes power state, CPU and memory configuration, guest OS,
-     * IP addresses, host information, and other detailed VM properties.
-     * 
+     * MCP tool: Provides configured resources and current power status for a VM.
+     *
      * @param vmName The friendly name of the virtual machine
-     * @return DetailedVMInfo object containing detailed VM information
+     * @return VMResourceSummary containing CPU, memory, guest OS, and power information
      */
-    @Tool(description = "Get detailed information about a virtual machine. Parameter: vmName (String) - the friendly name of the virtual machine")
-    public DetailedVMInfo getVMDetails(String vmName) {
-        logger.info("=== MCP TOOL CALLED: getVMDetails({}) ===", vmName);
+    @Tool(description = "Get configured resources and current power status of a virtual machine. Parameter: vmName (String) - the friendly name of the virtual machine")
+    public VMResourceSummary getVMResourceSummary(String vmName) {
+        logger.info("=== MCP TOOL CALLED: getVMResourceSummary({}) ===", vmName);
         try {
-            IdResolutionResult resolution = getVmIdByName(vmName);
+            VmDetailsSnapshot snapshot = fetchVmDetailsSnapshot(vmName);
+            VMResourceSummary summary = new VMResourceSummary(
+                snapshot.getVmId(),
+                snapshot.getName(),
+                snapshot.getPowerState(),
+                snapshot.getGuestOs(),
+                snapshot.getCpuCount(),
+                snapshot.getMemoryBytes()
+            );
+            if (snapshot.hasWarning()) {
+                summary.setWarning(snapshot.getWarning());
+            }
+            logger.info("Successfully retrieved resource summary for VM: {}", vmName);
+            return summary;
+        } catch (Exception e) {
+            logger.error("Failed to get VM resource summary for '{}': {}", vmName, e.getMessage(), e);
+            throw new RuntimeException("Failed to get VM resource summary for '" + vmName + "': " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * MCP tool: Provides hosting information (datacenter, cluster, resource pool, datastore) for a VM.
+     *
+     * @param vmName The friendly name of the virtual machine
+     * @return VMLocationDetails containing infrastructure placement data
+     */
+    @Tool(description = "Get hosting information for a virtual machine, including datacenter, cluster, resource pool, and datastore. Parameter: vmName (String) - the friendly name of the virtual machine")
+    public VMLocationDetails getVMLocationDetails(String vmName) {
+        logger.info("=== MCP TOOL CALLED: getVMLocationDetails({}) ===", vmName);
+        try {
+            VmDetailsSnapshot snapshot = fetchVmDetailsSnapshot(vmName);
+
+            String datacenterName = resolveDatacenterNameById(snapshot.getDatacenterId());
+            String clusterName = resolveClusterNameById(snapshot.getClusterId());
+            String resourcePoolName = resolveResourcePoolNameById(snapshot.getResourcePoolId());
+            String hostName = resolveHostNameById(snapshot.getHostId());
+            List<String> datastoreNames = resolveDatastoreNames(snapshot.getDatastoreIds());
+
+            VMLocationDetails details = new VMLocationDetails(
+                snapshot.getVmId(),
+                snapshot.getName(),
+                snapshot.getDatacenterId(),
+                datacenterName,
+                snapshot.getClusterId(),
+                clusterName,
+                snapshot.getResourcePoolId(),
+                resourcePoolName,
+                snapshot.getDatastoreIds(),
+                datastoreNames,
+                snapshot.getHostId(),
+                hostName
+            );
+            details.setPlacementDataAvailable(snapshot.isPlacementAvailable());
+            if (snapshot.hasWarning()) {
+                details.setWarning(snapshot.getWarning());
+            }
+
+            logger.info("Successfully retrieved location details for VM: {}", vmName);
+            return details;
+        } catch (Exception e) {
+            logger.error("Failed to get VM location details for '{}': {}", vmName, e.getMessage(), e);
+            throw new RuntimeException("Failed to get VM location details for '" + vmName + "': " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * MCP tool: Provides hypervisor version/build information for a host.
+     *
+     * @param hostName Friendly name of the ESXi host
+     * @return HostVersionInfo containing product and hardware details
+     */
+    @Tool(description = "Get version/build information for an ESXi host. Parameter: hostName (String) - the friendly name of the host")
+    public HostVersionInfo getHostVersion(String hostName) {
+        logger.info("=== MCP TOOL CALLED: getHostVersion({}) ===", hostName);
+        try {
+            IdResolutionResult resolution = getHostIdByName(hostName);
             if (resolution.getId() == null) {
-                throw new RuntimeException("VM not found: " + vmName);
+                throw new RuntimeException("Host not found: " + hostName);
             }
-            
+
             if (resolution.hasWarning()) {
-                logger.warn("Duplicate VM name detected: {}", resolution.getWarning());
+                logger.warn("Duplicate host name detected: {}", resolution.getWarning());
             }
-            
-            logger.info("Getting detailed information for VM: {} (ID: {})", vmName, resolution.getId());
-            JsonNode vmDetailsNode = vapiClient.vms().get(resolution.getId());
-            
-            // Parse the detailed VM information
-            String name = vmName;
-            String powerState = "unknown";
-            String guestOs = "unknown";
-            int cpuCount = -1;
-            long memoryBytes = -1;
-            String vmIdValue = resolution.getId();
-            String hostId = "";
-            String hostName = "";
-            String datastoreId = "";
-            String datastoreName = "";
-            String resourcePoolId = "";
-            String resourcePoolName = "";
-            String vmFolderId = "";
-            String vmFolderName = "";
-            
-            if (vmDetailsNode.isArray() && vmDetailsNode.size() > 0) {
-                JsonNode vm = vmDetailsNode.get(0);
-                name = vm.has("name") ? vm.get("name").asText() : vmName;
-                powerState = vm.has("power_state") ? vm.get("power_state").asText() : "unknown";
-                
-                // CPU configuration
-                if (vm.has("cpu")) {
-                    if (vm.get("cpu").has("count")) {
-                        cpuCount = vm.get("cpu").get("count").asInt();
-                    }
+
+            JsonNode hostDetails = vapiClient.hosts().get(resolution.getId());
+            String resolvedName = hostDetails.has("name") ? hostDetails.get("name").asText() : hostName;
+            String connectionState = hostDetails.has("connection_state") ? hostDetails.get("connection_state").asText() : "unknown";
+            String powerState = hostDetails.has("power_state") ? hostDetails.get("power_state").asText() : "unknown";
+
+            String productName = "unknown";
+            String productVersion = "unknown";
+            String productBuild = "unknown";
+            if (hostDetails.has("product")) {
+                JsonNode product = hostDetails.get("product");
+                if (product.has("name")) {
+                    productName = product.get("name").asText();
                 }
-                
-                // Memory configuration
-                if (vm.has("memory")) {
-                    if (vm.get("memory").has("size_MiB")) {
-                        memoryBytes = vm.get("memory").get("size_MiB").asLong() * 1024 * 1024; // Convert MiB to bytes
-                    }
+                if (product.has("version")) {
+                    productVersion = product.get("version").asText();
+                } else if (product.has("full_version")) {
+                    productVersion = product.get("full_version").asText();
                 }
-                
-                // Guest OS
-                if (vm.has("guest_OS")) {
-                    guestOs = vm.get("guest_OS").asText();
+                if (product.has("build")) {
+                    productBuild = product.get("build").asText();
                 }
-                
-                // Host information
-                if (vm.has("host")) {
-                    hostId = vm.get("host").asText();
-                    // Try to resolve host name
-                    try {
-                        IdResolutionResult hostResolution = getHostIdByName(hostId);
-                        if (hostResolution.getId() != null) {
-                            // If found, we already have the ID, just need the name
-                            // For simplicity, use the host ID as name for now
-                            hostName = hostId;
-                        }
-                    } catch (Exception e) {
-                        logger.debug("Could not resolve host name for ID: {}", hostId);
-                    }
-                }
-                
-                // Datastore information
-                if (vm.has("datastore")) {
-                    datastoreId = vm.get("datastore").asText();
-                    // For simplicity, use datastore ID as name for now
-                    datastoreName = datastoreId;
-                }
-                
-                // Resource pool information
-                if (vm.has("resource_pool")) {
-                    resourcePoolId = vm.get("resource_pool").asText();
-                    // Try to resolve resource pool name
-                    try {
-                        IdResolutionResult rpResolution = getResourcePoolIdByName(resourcePoolId);
-                        if (rpResolution.getId() != null) {
-                            resourcePoolName = resourcePoolId;
-                        }
-                    } catch (Exception e) {
-                        logger.debug("Could not resolve resource pool name for ID: {}", resourcePoolId);
-                    }
-                }
-                
-                // VM folder information
-                if (vm.has("folder")) {
-                    vmFolderId = vm.get("folder").asText();
-                    // For simplicity, use folder ID as name for now
-                    vmFolderName = vmFolderId;
-                }
+            } else if (hostDetails.has("version")) {
+                productVersion = hostDetails.get("version").asText();
             }
-            
-            DetailedVMInfo vmInfo = new DetailedVMInfo(
-                vmIdValue,
-                name,
-                powerState,
-                guestOs,
-                cpuCount,
-                memoryBytes,
-                hostId,
-                hostName,
-                datastoreId,
-                datastoreName,
+
+            JsonNode hardware = hostDetails.path("hardware");
+            String vendor = hardware.isMissingNode() ? "unknown" : hardware.path("vendor").asText("unknown");
+            String model = hardware.isMissingNode() ? "unknown" : hardware.path("model").asText("unknown");
+
+            HostVersionInfo info = new HostVersionInfo(
+                resolution.getId(),
+                resolvedName,
+                productName,
+                productVersion,
+                productBuild,
+                vendor,
+                model,
+                connectionState,
+                powerState
+            );
+
+            if (resolution.hasWarning()) {
+                info.setWarning(resolution.getWarning());
+            }
+
+            logger.info("Successfully retrieved host version info for {}", hostName);
+            return info;
+        } catch (Exception e) {
+            logger.error("Failed to get host version for '{}': {}", hostName, e.getMessage(), e);
+            throw new RuntimeException("Failed to get host version for '" + hostName + "': " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * MCP tool: Reports the resource pool a VM belongs to.
+     *
+     * @param vmName The friendly name of the virtual machine
+     * @return VMResourcePoolInfo containing the pool ID and friendly name
+     */
+    @Tool(description = "Identify which resource pool a virtual machine belongs to. Parameter: vmName (String) - the friendly name of the virtual machine")
+    public VMResourcePoolInfo getVMResourcePool(String vmName) {
+        logger.info("=== MCP TOOL CALLED: getVMResourcePool({}) ===", vmName);
+        try {
+            VmDetailsSnapshot snapshot = fetchVmDetailsSnapshot(vmName);
+            String resourcePoolId = snapshot.getResourcePoolId();
+            String resourcePoolName = resolveResourcePoolNameById(resourcePoolId);
+            String clusterId = snapshot.getClusterId();
+            String clusterName = resolveClusterNameById(clusterId);
+
+            VMResourcePoolInfo info = new VMResourcePoolInfo(
+                snapshot.getVmId(),
+                snapshot.getName(),
                 resourcePoolId,
                 resourcePoolName,
-                vmFolderId,
-                vmFolderName
+                clusterId,
+                clusterName
             );
-            
-            // Add warning if duplicate names were detected
-            if (resolution.hasWarning()) {
-                vmInfo.setWarning(resolution.getWarning());
+            info.setPlacementDataAvailable(snapshot.isPlacementAvailable());
+            if (snapshot.hasWarning()) {
+                info.setWarning(snapshot.getWarning());
             }
-            
-            logger.info("Successfully retrieved detailed information for VM: {}", vmName);
-            return vmInfo;
+
+            logger.info("Successfully retrieved resource pool info for VM: {}", vmName);
+            return info;
         } catch (Exception e) {
-            logger.error("Failed to get VM details for '{}': {}", vmName, e.getMessage(), e);
-            throw new RuntimeException("Failed to get VM details for '" + vmName + "': " + e.getMessage(), e);
+            logger.error("Failed to get VM resource pool for '{}': {}", vmName, e.getMessage(), e);
+            throw new RuntimeException("Failed to get VM resource pool for '" + vmName + "': " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Resolves the VM by name and builds a snapshot of its details from vAPI/REST,
+     * with retries and fallbacks to list-based data when detail endpoints fail.
+     *
+     * @param vmName friendly name of the VM
+     * @return populated VmDetailsSnapshot (never null)
+     * @throws RuntimeException if VM not found or basic data cannot be determined
+     */
+    private VmDetailsSnapshot fetchVmDetailsSnapshot(String vmName) {
+        IdResolutionResult resolution = getVmIdByName(vmName);
+        if (resolution.getId() == null) {
+            throw new RuntimeException("VM not found: " + vmName);
+        }
+
+        VmDetailsSnapshot snapshot = new VmDetailsSnapshot(resolution.getId(), vmName, resolution.getWarning());
+        int retryDelayMs = RETRY_DELAY_MS;
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                JsonNode rawDetails = vapiClient.vms().get(resolution.getId());
+                JsonNode normalizedNode = normalizeVmDetailsNode(rawDetails);
+                if (normalizedNode != null) {
+                    snapshot.populateFromDetailedNode(normalizedNode);
+                    logger.info("Retrieved detailed VM data on attempt {}", attempt);
+                    break;
+                } else {
+                    logger.warn("Detailed VM get response was empty on attempt {}", attempt);
+                }
+            } catch (Exception e) {
+                lastException = e;
+                logger.warn("Failed to retrieve detailed VM info on attempt {}: {}", attempt, e.getMessage());
+                if (attempt < MAX_RETRIES) {
+                    try {
+                        Thread.sleep(retryDelayMs);
+                        retryDelayMs *= 2;
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted while retrieving VM details", ie);
+                    }
+                }
+            }
+        }
+
+        if (snapshot.isBasicDataIncomplete() && resolution.getMetadata() != null) {
+            snapshot.populateBasicFromSummaryNode(resolution.getMetadata());
+        }
+
+        if (snapshot.isBasicDataIncomplete()) {
+            try {
+                JsonNode vmsNode = vapiClient.vms().list(null, null);
+                for (JsonNode vm : vmsNode) {
+                    if (vm.has("vm") && resolution.getId().equals(vm.get("vm").asText())) {
+                        snapshot.populateBasicFromSummaryNode(vm);
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                lastException = e;
+                logger.warn("Failed to retrieve VM list for fallback: {}", e.getMessage());
+            }
+        }
+
+        if (snapshot.isBasicDataIncomplete()) {
+            String errorMessage = "Unable to retrieve configured resources for VM '" + vmName + "'.";
+            if (lastException != null) {
+                errorMessage += " Last error: " + lastException.getMessage();
+            }
+            throw new RuntimeException(errorMessage, lastException);
+        }
+
+        return snapshot;
+    }
+
+    /**
+     * Normalizes VM details from vAPI/REST into a single object node: unwraps
+     * arrays (first element) and a "value" wrapper so callers see a consistent shape.
+     *
+     * @param vmDetailsNode raw response from VM get (array or object, possibly with "value")
+     * @return single object node or null if empty/missing
+     */
+    private JsonNode normalizeVmDetailsNode(JsonNode vmDetailsNode) {
+        if (vmDetailsNode == null || vmDetailsNode.isNull()) {
+            return null;
+        }
+        JsonNode candidate = vmDetailsNode;
+        if (candidate.isArray()) {
+            if (candidate.size() == 0) {
+                return null;
+            }
+            candidate = candidate.get(0);
+        }
+        if (candidate.has("value") && candidate.get("value").isObject()) {
+            candidate = candidate.get("value");
+        }
+        return candidate;
+    }
+
+    private String resolveHostNameById(String hostId) {
+        if (hostId == null || hostId.isEmpty()) {
+            return "";
+        }
+        try {
+            JsonNode hostsNode = vapiClient.hosts().list();
+            return resolveInventoryName(hostsNode, "host", hostId, "name");
+        } catch (Exception e) {
+            logger.debug("Failed to resolve host name for '{}': {}", hostId, e.getMessage());
+            return hostId;
+        }
+    }
+
+    private String resolveDatacenterNameById(String datacenterId) {
+        if (datacenterId == null || datacenterId.isEmpty()) {
+            return "";
+        }
+        try {
+            JsonNode datacentersNode = vapiClient.datacenters().list();
+            return resolveInventoryName(datacentersNode, "datacenter", datacenterId, "name");
+        } catch (Exception e) {
+            logger.debug("Failed to resolve datacenter name for '{}': {}", datacenterId, e.getMessage());
+            return datacenterId;
+        }
+    }
+
+    private String resolveClusterNameById(String clusterId) {
+        if (clusterId == null || clusterId.isEmpty()) {
+            return "";
+        }
+        try {
+            JsonNode clustersNode = vapiClient.clusters().list();
+            return resolveInventoryName(clustersNode, "cluster", clusterId, "name");
+        } catch (Exception e) {
+            logger.debug("Failed to resolve cluster name for '{}': {}", clusterId, e.getMessage());
+            return clusterId;
+        }
+    }
+
+    private String resolveResourcePoolNameById(String resourcePoolId) {
+        if (resourcePoolId == null || resourcePoolId.isEmpty()) {
+            return "";
+        }
+        try {
+            JsonNode clustersNode = vapiClient.clusters().list();
+            for (JsonNode cluster : clustersNode) {
+                String clusterId = cluster.get("cluster").asText();
+                JsonNode pools = vapiClient.resourcePools().list(clusterId);
+                for (JsonNode pool : pools) {
+                    if (pool.has("resource_pool") && resourcePoolId.equals(pool.get("resource_pool").asText())) {
+                        return pool.has("name") ? pool.get("name").asText() : resourcePoolId;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to resolve resource pool name for '{}': {}", resourcePoolId, e.getMessage());
+        }
+        return resourcePoolId;
+    }
+
+    private List<String> resolveDatastoreNames(List<String> datastoreIds) {
+        if (datastoreIds == null || datastoreIds.isEmpty()) {
+            return List.of();
+        }
+        try {
+            JsonNode datastoresNode = vapiClient.datastores().list();
+            List<String> names = new ArrayList<>();
+            for (String datastoreId : datastoreIds) {
+                names.add(resolveDatastoreNameById(datastoreId, datastoresNode));
+            }
+            return names;
+        } catch (Exception e) {
+            logger.debug("Failed to resolve datastore names: {}", e.getMessage());
+            return new ArrayList<>(datastoreIds);
+        }
+    }
+
+    private String resolveDatastoreNameById(String datastoreId, JsonNode datastoresNode) {
+        if (datastoresNode == null) {
+            return datastoreId;
+        }
+        return resolveInventoryName(datastoresNode, "datastore", datastoreId, "name");
+    }
+
+    /**
+     * Finds an item in a list-style JsonNode by ID and returns its name field.
+     *
+     * @param items array of objects with idKey and nameKey
+     * @param idKey field holding the ID (e.g. "host", "datacenter")
+     * @param targetId ID to match
+     * @param nameKey field holding the display name
+     * @return name if found, otherwise targetId
+     */
+    private String resolveInventoryName(JsonNode items, String idKey, String targetId, String nameKey) {
+        if (targetId == null || targetId.isEmpty()) {
+            return "";
+        }
+        if (items != null) {
+            for (JsonNode item : items) {
+                if (item.has(idKey) && targetId.equals(item.get(idKey).asText())) {
+                    return item.has(nameKey) ? item.get(nameKey).asText() : targetId;
+                }
+            }
+        }
+        return targetId;
     }
 
     /**
@@ -852,15 +1132,18 @@ public class VCenterService {
     private static class IdResolutionResult {
         private final String id;
         private final String warning;
+        private final JsonNode metadata;
         
-        public IdResolutionResult(String id, String warning) {
+        public IdResolutionResult(String id, String warning, JsonNode metadata) {
             this.id = id;
             this.warning = warning;
+            this.metadata = metadata;
         }
         
         public String getId() { return id; }
         public String getWarning() { return warning; }
         public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
+        public JsonNode getMetadata() { return metadata; }
     }
 
     /**
@@ -888,7 +1171,7 @@ public class VCenterService {
             }
             
             if (foundId == null) {
-                return new IdResolutionResult(null, null);
+                return new IdResolutionResult(null, null, null);
             }
             
             String warning = null;
@@ -897,10 +1180,10 @@ public class VCenterService {
                 logger.warn(warning);
             }
             
-            return new IdResolutionResult(foundId, warning);
+            return new IdResolutionResult(foundId, warning, null);
         } catch (Exception e) {
             logger.error("Failed to get cluster ID for name '{}': {}", clusterName, e.getMessage());
-            return new IdResolutionResult(null, null);
+            return new IdResolutionResult(null, null, null);
         }
     }
 
@@ -934,7 +1217,7 @@ public class VCenterService {
             }
             
             if (foundId == null) {
-                return new IdResolutionResult(null, null);
+                return new IdResolutionResult(null, null, null);
             }
             
             String warning = null;
@@ -943,10 +1226,10 @@ public class VCenterService {
                 logger.warn(warning);
             }
             
-            return new IdResolutionResult(foundId, warning);
+            return new IdResolutionResult(foundId, warning, null);
         } catch (Exception e) {
             logger.error("Failed to get resource pool ID for name '{}': {}", resourcePoolName, e.getMessage());
-            return new IdResolutionResult(null, null);
+            return new IdResolutionResult(null, null, null);
         }
     }
     
@@ -960,35 +1243,62 @@ public class VCenterService {
      * @return IdResolutionResult containing the VM ID and any warnings about duplicates
      */
     private IdResolutionResult getVmIdByName(String vmName) {
-        try {
-            JsonNode vmsNode = vapiClient.vms().list(null, null);
-            String foundId = null;
-            int matchCount = 0;
-            
-            for (JsonNode vm : vmsNode) {
-                if (vm.has("name") && vm.get("name").asText().equals(vmName)) {
-                    if (foundId == null) {
-                        foundId = vm.get("vm").asText();
+        int retryDelayMs = RETRY_DELAY_MS;
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                logger.info("Attempting to list VMs to find '{}' (attempt {}/{})", vmName, attempt, MAX_RETRIES);
+                JsonNode vmsNode = vapiClient.vms().list(null, null);
+                String foundId = null;
+                int matchCount = 0;
+                JsonNode matchedVmNode = null;
+                
+                for (JsonNode vm : vmsNode) {
+                    if (vm.has("name") && vm.get("name").asText().equals(vmName)) {
+                        if (foundId == null) {
+                            foundId = vm.get("vm").asText();
+                            matchedVmNode = vm.deepCopy();
+                        }
+                        matchCount++;
                     }
-                    matchCount++;
+                }
+                
+                if (foundId == null) {
+                    logger.info("VM '{}' not found in list", vmName);
+                    return new IdResolutionResult(null, null, null);
+                }
+                
+                String warning = null;
+                if (matchCount > 1) {
+                    warning = String.format("WARNING: Found %d VMs with the same name '%s'. Using the first match.", matchCount, vmName);
+                    logger.warn(warning);
+                }
+                
+                logger.info("Successfully found VM '{}' with ID {} on attempt {}", vmName, foundId, attempt);
+                return new IdResolutionResult(foundId, warning, matchedVmNode);
+            } catch (Exception e) {
+                lastException = e;
+                logger.warn("Failed to get VM ID for name '{}' on attempt {}: {}", vmName, attempt, e.getMessage());
+                
+                if (attempt < MAX_RETRIES) {
+                    try {
+                        Thread.sleep(retryDelayMs);
+                        retryDelayMs *= 2;
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        logger.error("Interrupted during retry for VM '{}'", vmName);
+                        return new IdResolutionResult(null, null, null);
+                    }
                 }
             }
-            
-            if (foundId == null) {
-                return new IdResolutionResult(null, null);
-            }
-            
-            String warning = null;
-            if (matchCount > 1) {
-                warning = String.format("WARNING: Found %d VMs with the same name '%s'. Using the first match.", matchCount, vmName);
-                logger.warn(warning);
-            }
-            
-            return new IdResolutionResult(foundId, warning);
-        } catch (Exception e) {
-            logger.error("Failed to get VM ID for name '{}': {}", vmName, e.getMessage());
-            return new IdResolutionResult(null, null);
         }
+        
+        logger.error("Failed to get VM ID for name '{}' after {} attempts", vmName, MAX_RETRIES);
+        if (lastException != null) {
+            logger.error("Last exception: {}", lastException.getMessage(), lastException);
+        }
+        return new IdResolutionResult(null, null, null);
     }
     
     /**
@@ -1016,7 +1326,7 @@ public class VCenterService {
             }
             
             if (foundId == null) {
-                return new IdResolutionResult(null, null);
+                return new IdResolutionResult(null, null, null);
             }
             
             String warning = null;
@@ -1025,10 +1335,10 @@ public class VCenterService {
                 logger.warn(warning);
             }
             
-            return new IdResolutionResult(foundId, warning);
+            return new IdResolutionResult(foundId, warning, null);
         } catch (Exception e) {
             logger.error("Failed to get host ID for name '{}': {}", hostName, e.getMessage());
-            return new IdResolutionResult(null, null);
+            return new IdResolutionResult(null, null, null);
         }
     }
 
@@ -1268,48 +1578,26 @@ public class VCenterService {
     }
 
     /**
-     * Data structure representing detailed information about a virtual machine.
-     * 
-     * This class holds comprehensive information about a VM including power state,
-     * CPU and memory configuration, guest OS, host information, datastore, resource pool,
-     * VM folder, and other properties.
+     * Data structure representing configured resources for a virtual machine.
      */
-    public static class DetailedVMInfo {
+    public static class VMResourceSummary {
         private final String id;
         private final String name;
         private final String powerState;
         private final String guestOs;
         private final int cpuCount;
         private final long memoryBytes;
-        private final String hostId;
-        private final String hostName;
-        private final String datastoreId;
-        private final String datastoreName;
-        private final String resourcePoolId;
-        private final String resourcePoolName;
-        private final String vmFolderId;
-        private final String vmFolderName;
+        private final long memoryMB;
         private String warning;
 
-        public DetailedVMInfo(String id, String name, String powerState, String guestOs, 
-                             int cpuCount, long memoryBytes, String hostId, String hostName,
-                             String datastoreId, String datastoreName, String resourcePoolId, 
-                             String resourcePoolName, String vmFolderId, String vmFolderName) {
+        public VMResourceSummary(String id, String name, String powerState, String guestOs, int cpuCount, long memoryBytes) {
             this.id = id;
             this.name = name;
             this.powerState = powerState;
             this.guestOs = guestOs;
             this.cpuCount = cpuCount;
             this.memoryBytes = memoryBytes;
-            this.hostId = hostId;
-            this.hostName = hostName;
-            this.datastoreId = datastoreId;
-            this.datastoreName = datastoreName;
-            this.resourcePoolId = resourcePoolId;
-            this.resourcePoolName = resourcePoolName;
-            this.vmFolderId = vmFolderId;
-            this.vmFolderName = vmFolderName;
-            this.warning = null;
+            this.memoryMB = memoryBytes > 0 ? memoryBytes / (1024 * 1024) : -1;
         }
 
         public String getId() { return id; }
@@ -1318,28 +1606,385 @@ public class VCenterService {
         public String getGuestOs() { return guestOs; }
         public int getCpuCount() { return cpuCount; }
         public long getMemoryBytes() { return memoryBytes; }
-        public String getMemoryMB() { return memoryBytes > 0 ? String.valueOf(memoryBytes / (1024 * 1024)) : "N/A"; }
-        public String getHostId() { return hostId; }
-        public String getHostName() { return hostName; }
-        public String getDatastoreId() { return datastoreId; }
-        public String getDatastoreName() { return datastoreName; }
-        public String getResourcePoolId() { return resourcePoolId; }
-        public String getResourcePoolName() { return resourcePoolName; }
-        public String getVmFolderId() { return vmFolderId; }
-        public String getVmFolderName() { return vmFolderName; }
+        public long getMemoryMB() { return memoryMB; }
         public String getWarning() { return warning; }
         public void setWarning(String warning) { this.warning = warning; }
         public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
 
         @Override
         public String toString() {
-            String base = "DetailedVMInfo{id='" + id + "', name='" + name + 
-                   "', powerState='" + powerState + "', guestOs='" + guestOs + 
-                   "', cpuCount=" + cpuCount + ", memoryBytes=" + memoryBytes + 
-                   ", hostId='" + hostId + "', hostName='" + hostName + 
-                   "', datastoreId='" + datastoreId + "', datastoreName='" + datastoreName +
+            String base = "VMResourceSummary{id='" + id + "', name='" + name +
+                   "', powerState='" + powerState + "', guestOs='" + guestOs +
+                   "', cpuCount=" + cpuCount + ", memoryBytes=" + memoryBytes + "}";
+            if (hasWarning()) {
+                base += ", warning='" + warning + "'";
+            }
+            return base;
+        }
+    }
+
+    /**
+     * Data structure representing hosting information for a virtual machine.
+     */
+    public static class VMLocationDetails {
+        private final String id;
+        private final String name;
+        private final String datacenterId;
+        private final String datacenterName;
+        private final String clusterId;
+        private final String clusterName;
+        private final String resourcePoolId;
+        private final String resourcePoolName;
+        private final List<String> datastoreIds;
+        private final List<String> datastoreNames;
+        private final String hostId;
+        private final String hostName;
+        private boolean placementDataAvailable;
+        private String warning;
+
+        public VMLocationDetails(
+            String id,
+            String name,
+            String datacenterId,
+            String datacenterName,
+            String clusterId,
+            String clusterName,
+            String resourcePoolId,
+            String resourcePoolName,
+            List<String> datastoreIds,
+            List<String> datastoreNames,
+            String hostId,
+            String hostName
+        ) {
+            this.id = id;
+            this.name = name;
+            this.datacenterId = datacenterId;
+            this.datacenterName = datacenterName;
+            this.clusterId = clusterId;
+            this.clusterName = clusterName;
+            this.resourcePoolId = resourcePoolId;
+            this.resourcePoolName = resourcePoolName;
+            this.datastoreIds = datastoreIds == null ? List.of() : new ArrayList<>(datastoreIds);
+            this.datastoreNames = datastoreNames == null ? List.of() : new ArrayList<>(datastoreNames);
+            this.hostId = hostId;
+            this.hostName = hostName;
+        }
+
+        public String getId() { return id; }
+        public String getName() { return name; }
+        public String getDatacenterId() { return datacenterId; }
+        public String getDatacenterName() { return datacenterName; }
+        public String getClusterId() { return clusterId; }
+        public String getClusterName() { return clusterName; }
+        public String getResourcePoolId() { return resourcePoolId; }
+        public String getResourcePoolName() { return resourcePoolName; }
+        public List<String> getDatastoreIds() { return new ArrayList<>(datastoreIds); }
+        public List<String> getDatastoreNames() { return new ArrayList<>(datastoreNames); }
+        public String getHostId() { return hostId; }
+        public String getHostName() { return hostName; }
+        public boolean isPlacementDataAvailable() { return placementDataAvailable; }
+        public void setPlacementDataAvailable(boolean placementDataAvailable) { this.placementDataAvailable = placementDataAvailable; }
+        public String getWarning() { return warning; }
+        public void setWarning(String warning) { this.warning = warning; }
+        public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
+
+        @Override
+        public String toString() {
+            String base = "VMLocationDetails{id='" + id + "', name='" + name +
+                   "', datacenterId='" + datacenterId + "', datacenterName='" + datacenterName +
+                   "', clusterId='" + clusterId + "', clusterName='" + clusterName +
                    "', resourcePoolId='" + resourcePoolId + "', resourcePoolName='" + resourcePoolName +
-                   "', vmFolderId='" + vmFolderId + "', vmFolderName='" + vmFolderName + "'}";
+                   "', datastoreIds=" + datastoreIds + ", datastoreNames=" + datastoreNames +
+                   ", hostId='" + hostId + "', hostName='" + hostName +
+                   "', placementDataAvailable=" + placementDataAvailable + "}";
+            if (hasWarning()) {
+                base += ", warning='" + warning + "'";
+            }
+            return base;
+        }
+    }
+
+    /**
+     * Data structure representing host version/build information.
+     */
+    public static class HostVersionInfo {
+        private final String hostId;
+        private final String hostName;
+        private final String productName;
+        private final String productVersion;
+        private final String productBuild;
+        private final String hardwareVendor;
+        private final String hardwareModel;
+        private final String connectionState;
+        private final String powerState;
+        private String warning;
+
+        public HostVersionInfo(String hostId, String hostName, String productName, String productVersion, String productBuild,
+                               String hardwareVendor, String hardwareModel, String connectionState, String powerState) {
+            this.hostId = hostId;
+            this.hostName = hostName;
+            this.productName = productName;
+            this.productVersion = productVersion;
+            this.productBuild = productBuild;
+            this.hardwareVendor = hardwareVendor;
+            this.hardwareModel = hardwareModel;
+            this.connectionState = connectionState;
+            this.powerState = powerState;
+        }
+
+        public String getHostId() { return hostId; }
+        public String getHostName() { return hostName; }
+        public String getProductName() { return productName; }
+        public String getProductVersion() { return productVersion; }
+        public String getProductBuild() { return productBuild; }
+        public String getHardwareVendor() { return hardwareVendor; }
+        public String getHardwareModel() { return hardwareModel; }
+        public String getConnectionState() { return connectionState; }
+        public String getPowerState() { return powerState; }
+        public String getWarning() { return warning; }
+        public void setWarning(String warning) { this.warning = warning; }
+        public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
+
+        @Override
+        public String toString() {
+            String base = "HostVersionInfo{hostId='" + hostId + "', hostName='" + hostName +
+                "', productName='" + productName + "', productVersion='" + productVersion +
+                "', productBuild='" + productBuild + "', hardwareVendor='" + hardwareVendor +
+                "', hardwareModel='" + hardwareModel + "', connectionState='" + connectionState +
+                "', powerState='" + powerState + "'}";
+            if (hasWarning()) {
+                base += ", warning='" + warning + "'";
+            }
+            return base;
+        }
+    }
+
+    /**
+     * Internal snapshot that consolidates VM information from different endpoints.
+     * Populated from detailed get responses (with placement) and/or list/summary responses.
+     * Tracks basic config (name, power, guest OS, CPU, memory) and placement (host, cluster,
+     * datacenter, resource pool, datastores) with defensive handling of varying JSON shapes.
+     */
+    private static class VmDetailsSnapshot {
+        private final String vmId;
+        private final String warning;
+        private String name;
+        private String powerState = "unknown";
+        private String guestOs = "unknown";
+        private int cpuCount = -1;
+        private long memoryBytes = -1;
+        private String hostId = "";
+        private String clusterId = "";
+        private String datacenterId = "";
+        private String resourcePoolId = "";
+        private final List<String> datastoreIds = new ArrayList<>();
+        private boolean placementAvailable = false;
+
+        VmDetailsSnapshot(String vmId, String defaultName, String warning) {
+            this.vmId = vmId;
+            this.name = defaultName;
+            this.warning = warning;
+        }
+
+        void populateFromDetailedNode(JsonNode node) {
+            if (node == null) {
+                return;
+            }
+            updateBasicInfo(node);
+            updatePlacementInfo(node);
+        }
+
+        void populateBasicFromSummaryNode(JsonNode node) {
+            if (node == null) {
+                return;
+            }
+            updateBasicInfo(node);
+        }
+
+        private void updateBasicInfo(JsonNode node) {
+            if (node.has("name")) {
+                this.name = node.get("name").asText();
+            }
+            if (node.has("power_state")) {
+                this.powerState = node.get("power_state").asText();
+            }
+            if (node.has("guest_OS")) {
+                this.guestOs = node.get("guest_OS").asText();
+            } else if (node.has("guest_os")) {
+                this.guestOs = node.get("guest_os").asText();
+            }
+            if (node.has("cpu") && node.get("cpu").isObject() && node.get("cpu").has("count")) {
+                this.cpuCount = node.get("cpu").get("count").asInt();
+            } else if (node.has("cpu_count")) {
+                this.cpuCount = node.get("cpu_count").asInt();
+            }
+            if (node.has("memory") && node.get("memory").isObject() && node.get("memory").has("size_MiB")) {
+                this.memoryBytes = node.get("memory").get("size_MiB").asLong() * 1024 * 1024;
+            } else if (node.has("memory_size_MiB")) {
+                this.memoryBytes = node.get("memory_size_MiB").asLong() * 1024 * 1024;
+            }
+        }
+
+        private void updatePlacementInfo(JsonNode node) {
+            JsonNode placementNode = node.has("placement") ? node.get("placement") : null;
+            boolean fieldFound = false;
+
+            fieldFound |= assignIfPresent(placementNode, node, "host", value -> this.hostId = value);
+            fieldFound |= assignIfPresent(placementNode, node, "cluster", value -> this.clusterId = value);
+            fieldFound |= assignIfPresent(placementNode, node, "datacenter", value -> this.datacenterId = value);
+            fieldFound |= assignIfPresent(placementNode, node, "resource_pool", value -> this.resourcePoolId = value);
+
+            fieldFound |= addDatastoresFromNode(placementNode != null ? placementNode.get("datastore") : null);
+            fieldFound |= addDatastoresFromNode(placementNode != null ? placementNode.get("datastores") : null);
+            fieldFound |= addDatastoresFromNode(node.get("datastore"));
+            fieldFound |= addDatastoresFromNode(node.get("datastores"));
+
+            if (fieldFound) {
+                this.placementAvailable = true;
+            }
+        }
+
+        private boolean assignIfPresent(JsonNode preferred, JsonNode fallback, String key, Consumer<String> setter) {
+            JsonNode candidate = preferred != null && preferred.has(key) ? preferred.get(key)
+                : fallback != null && fallback.has(key) ? fallback.get(key) : null;
+            if (candidate == null || candidate.isNull()) {
+                return false;
+            }
+            String value = extractTextValue(candidate);
+            if (value.isEmpty()) {
+                return false;
+            }
+            setter.accept(value);
+            return true;
+        }
+
+        private boolean addDatastoresFromNode(JsonNode datastoreNode) {
+            if (datastoreNode == null || datastoreNode.isNull()) {
+                return false;
+            }
+            boolean added = false;
+            if (datastoreNode.isArray()) {
+                for (JsonNode ds : datastoreNode) {
+                    added |= addDatastoreIdInternal(extractId(ds));
+                }
+            } else {
+                added = addDatastoreIdInternal(extractId(datastoreNode));
+            }
+            return added;
+        }
+
+        private String extractId(JsonNode node) {
+            return extractTextValue(node);
+        }
+
+        private boolean addDatastoreIdInternal(String datastoreId) {
+            if (datastoreId == null || datastoreId.isEmpty()) {
+                return false;
+            }
+            if (!datastoreIds.contains(datastoreId)) {
+                datastoreIds.add(datastoreId);
+                return true;
+            }
+            return false;
+        }
+
+        public String getVmId() { return vmId; }
+        public String getWarning() { return warning; }
+        public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
+        public String getName() { return name; }
+        public String getPowerState() { return powerState; }
+        public String getGuestOs() { return guestOs; }
+        public int getCpuCount() { return cpuCount; }
+        public long getMemoryBytes() { return memoryBytes; }
+        public String getHostId() { return hostId; }
+        public String getClusterId() { return clusterId; }
+        public String getDatacenterId() { return datacenterId; }
+        public String getResourcePoolId() { return resourcePoolId; }
+        public List<String> getDatastoreIds() { return new ArrayList<>(datastoreIds); }
+        public boolean isPlacementAvailable() { return placementAvailable; }
+        public boolean isBasicDataIncomplete() { return cpuCount < 0 && memoryBytes < 0; }
+    }
+
+    /**
+     * Extracts a string identifier from a JsonNode that may be a primitive, or an object
+     * with "value", "id", "datastore", "host", "cluster", "resource_pool", or "datacenter".
+     * Used when parsing vAPI placement and reference fields.
+     *
+     * @param node JSON node (possibly nested)
+     * @return non-null string (possibly empty)
+     */
+    private static String extractTextValue(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return "";
+        }
+        if (node.isTextual() || node.isNumber() || node.isBoolean()) {
+            return node.asText();
+        }
+        if (node.has("value")) {
+            return extractTextValue(node.get("value"));
+        }
+        if (node.has("id")) {
+            return extractTextValue(node.get("id"));
+        }
+        if (node.has("datastore")) {
+            return extractTextValue(node.get("datastore"));
+        }
+        if (node.has("host")) {
+            return extractTextValue(node.get("host"));
+        }
+        if (node.has("cluster")) {
+            return extractTextValue(node.get("cluster"));
+        }
+        if (node.has("resource_pool")) {
+            return extractTextValue(node.get("resource_pool"));
+        }
+        if (node.has("datacenter")) {
+            return extractTextValue(node.get("datacenter"));
+        }
+        return "";
+    }
+
+    /**
+     * Data structure describing the resource pool membership of a VM.
+     */
+    public static class VMResourcePoolInfo {
+        private final String vmId;
+        private final String vmName;
+        private final String resourcePoolId;
+        private final String resourcePoolName;
+        private final String clusterId;
+        private final String clusterName;
+        private boolean placementDataAvailable;
+        private String warning;
+
+        public VMResourcePoolInfo(String vmId, String vmName, String resourcePoolId, String resourcePoolName,
+                                  String clusterId, String clusterName) {
+            this.vmId = vmId;
+            this.vmName = vmName;
+            this.resourcePoolId = resourcePoolId;
+            this.resourcePoolName = resourcePoolName;
+            this.clusterId = clusterId;
+            this.clusterName = clusterName;
+        }
+
+        public String getVmId() { return vmId; }
+        public String getVmName() { return vmName; }
+        public String getResourcePoolId() { return resourcePoolId; }
+        public String getResourcePoolName() { return resourcePoolName; }
+        public String getClusterId() { return clusterId; }
+        public String getClusterName() { return clusterName; }
+        public boolean isPlacementDataAvailable() { return placementDataAvailable; }
+        public void setPlacementDataAvailable(boolean placementDataAvailable) { this.placementDataAvailable = placementDataAvailable; }
+        public String getWarning() { return warning; }
+        public void setWarning(String warning) { this.warning = warning; }
+        public boolean hasWarning() { return warning != null && !warning.isEmpty(); }
+
+        @Override
+        public String toString() {
+            String base = "VMResourcePoolInfo{vmId='" + vmId + "', vmName='" + vmName +
+                "', resourcePoolId='" + resourcePoolId + "', resourcePoolName='" + resourcePoolName +
+                "', clusterId='" + clusterId + "', clusterName='" + clusterName +
+                "', placementDataAvailable=" + placementDataAvailable + "}";
             if (hasWarning()) {
                 base += ", warning='" + warning + "'";
             }
