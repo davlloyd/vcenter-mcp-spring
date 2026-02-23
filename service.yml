@@ -1,11 +1,10 @@
 ---
 name: vcenter-mcp-service
 description: "Model Context Protocol tools for querying and managing vCenter environments."
-bindable: true
 tags:
   - mcp
   - ai-tools
-  - mcpStreamableURL  
+  - mcpSseURL  
 metadata:
   displayName: "vCenter AI Tools"
   longDescription: "Provides LLMs with secure access to vCenter inventory, VM power states, and metrics via natural language."
@@ -14,9 +13,9 @@ metadata:
 plans:
   - name: standard
     description: "Standard shared access to the vCenter MCP server."
-    free: true
     metadata:
       displayName: "Standard Plan"
+      rateLimit: 100  # Enforces a strict 100 requests per minute at the Gateway
       bullets:
         - "Read-only access to vCenter inventory and simple VM operations"
-        - "Shared rate limits"
+        - "Rate limited to 100 requests per minute"
