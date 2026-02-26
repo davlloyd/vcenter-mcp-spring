@@ -9,7 +9,7 @@ applications:
     env:
       JBP_CONFIG_OPEN_JDK_JRE: '{ jre: { version: 21.+ } }'
     services:
-      - vcenter-service
+      - vcenter-vc01-creds
     #health-check-type: process
       # vCenter configuration will be provided via service binding
       # No need to set VCENTER_* variables here as they come from the service binding

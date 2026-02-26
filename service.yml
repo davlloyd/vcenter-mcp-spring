@@ -1,5 +1,5 @@
 ---
-name: vcenter-mcp-service
+name: vcenter-ai-service
 description: "Model Context Protocol tools for querying and managing vCenter environments."
 tags:
   - mcp
@@ -12,10 +12,18 @@ metadata:
   documentationUrl: "https://github.com/davlloyd/vcenter-mcp-spring"
 plans:
   - name: standard
-    description: "Standard shared access to the vCenter MCP server."
+    description: "Standard shared access to the vCenter MCP server"
     metadata:
       displayName: "Standard Plan"
       rateLimit: 100  # Enforces a strict 100 requests per minute at the Gateway
+      bullets:
+        - "Read-only access to vCenter inventory and simple VM operations"
+        - "Rate limited to 100 requests per minute"
+  - name: premium
+    description: "Premium performance shared access to the vCenter MCP server"
+    metadata:
+      displayName: "Premium Plan"
+      rateLimit: 500  # Enforces a strict 100 requests per minute at the Gateway
       bullets:
         - "Read-only access to vCenter inventory and simple VM operations"
         - "Rate limited to 100 requests per minute"
